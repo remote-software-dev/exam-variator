@@ -4,7 +4,7 @@ import json
 import base64
 import re
 import subprocess
-from groq import Groq
+import litellm
 from dotenv import load_dotenv
 
 # Add the project root to the path so we can import modules
@@ -12,46 +12,131 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 
 load_dotenv()
 
+# LiteLLM model fallback chain: tries models in order until one succeeds
+EXTRACTION_MODELS = [
+    "groq/llama-3.2-11b-vision-preview",
+    "groq/llama-3.3-70b-versatile",
+    "openai/gpt-4o-mini",
+]
+
+VARIATION_MODELS = [
+    "groq/llama-3.3-70b-versatile",
+    "openai/gpt-4o-mini",
+]
+
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
+def _extract_json(text):
+    """Robustly extract the first JSON object from model output."""
+    match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if not match:
+        match = re.search(r'(\{.*\})', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1).replace("'", '"'))
+        except json.JSONDecodeError:
+            return None
+    return None
+
 def extract_question_from_image(image_path):
-    print("  [1/4] Extracting question from image using Groq Vision...")
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    print("  [1/4] Extracting question from image via LiteLLM (with fallbacks)...")
     base64_image = encode_image(image_path)
-    
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": "You are an expert at extracting exam questions. Return ONLY a valid JSON object with keys: 'id', 'question_text', 'options' (list of strings). Use LaTeX math notation (e.g., $\\frac{a}{b}$, $x^2$) for formulas."},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Extract the first question from this image as JSON."},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
-            ]}
-        ],
-        model="llama-3.2-11b-vision-preview",
-        temperature=0.1,
+
+    system_prompt = (
+        "You are an expert at extracting Indonesian math exam questions from scanned images.\n"
+        "Return ONLY a valid JSON object with keys: 'id', 'question_text', 'options' (list of strings).\n\n"
+        "RULES:\n"
+        "- Use LaTeX math notation enclosed in $ delimiters for all formulas "
+        "(e.g., $\\frac{a}{b}$, $x^2$, $\\sqrt{3}$).\n"
+        "- 'id' must be the alphanumeric ID printed on the paper (e.g., '25MATBLGBRLM01SU-000000-0246').\n"
+        "  If no ID is visible or the ID is just a number like '1', generate a unique one: "
+        "'EXAM-<RANDOM8HEX>'.\n"
+        "- Handle ALL question formats:\n"
+        "  * Standard multiple choice (A/B/C/D/E) → put options in 'options' list.\n"
+        "  * Benar/Salah (True/False) tables → 'options' should be a list of statements "
+        "each prefixed with the table label, e.g. ['Pernyataan 1: Benar', 'Pernyataan 2: Salah'].\n"
+        "  * Multi-part / stem questions (e.g., 'pernyataan (1), (2), (3)') → put each "
+        "statement as a separate item in 'options'.\n"
+        "- Preserve the original Indonesian language.\n"
+        "- Use double quotes for all JSON keys and string values."
     )
-    
-    match = re.search(r'\{.*\}', chat_completion.choices[0].message.content, re.DOTALL)
-    return json.loads(match.group(0)) if match else None
+
+    user_content = [
+        {"type": "text", "text": "Extract the first complete question from this image as JSON."},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+    ]
+
+    for model in EXTRACTION_MODELS:
+        try:
+            response = litellm.completion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.1,
+            )
+            raw = response.choices[0].message.content
+            result = _extract_json(raw)
+            if result:
+                return result
+            print(f"  ⚠ {model} returned unparseable JSON, trying next...")
+        except Exception as e:
+            print(f"  ⚠ {model} failed: {e}, trying next...")
+
+    print("  ❌ All extraction models failed.")
+    return None
 
 def generate_variations(original_q):
-    print("  [2/4] Generating easier and harder variations using Groq Text...")
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-    
-    prompt = f"""Given this question: {json.dumps(original_q)}
-    Generate 'easier' and 'harder' variations. Keep the same topic. Use LaTeX math notation. 
-    Return ONLY a JSON object with keys 'easier' and 'harder', each containing 'question_text' and 'options'."""
-    
-    chat_completion = client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama-3.3-70b-versatile",
-        temperature=0.7,
+    print("  [2/4] Generating easier and harder variations via LiteLLM (with fallbacks)...")
+
+    system_prompt = (
+        "You are a math exam question writer for Indonesian secondary schools.\n"
+        "Given an original multiple-choice question, produce two variations: 'easier' and 'harder'.\n\n"
+        "STRICT FORMAT RULES:\n"
+        "- Return ONLY a valid JSON object.\n"
+        "- Top-level keys: 'easier' and 'harder'.\n"
+        "- Each variation must contain:\n"
+        "  * 'question_text': string (the question stem)\n"
+        "  * 'options': array of exactly 5 strings (labeled A through E in the output)\n"
+        "- Do NOT convert multiple-choice into essay or fill-in-the-blank questions.\n"
+        "- Do NOT change the number of options. Every variation MUST have exactly 5 options.\n"
+        "- Do NOT include option labels (A., B., etc.) inside the option strings — just the answer text.\n"
+        "- Use LaTeX math notation enclosed in $ delimiters for all formulas.\n"
+        "- Keep the same mathematical topic and difficulty relative to the label (easier = simpler numbers/steps, "
+        "harder = more complex numbers/steps or additional concepts).\n"
+        "- Preserve the original Indonesian language.\n"
+        "- Use double quotes for all JSON keys and string values.\n"
+        "- Do NOT wrap the JSON in markdown code fences."
     )
-    
-    match = re.search(r'\{.*\}', chat_completion.choices[0].message.content, re.DOTALL)
-    return json.loads(match.group(0)) if match else None
+
+    user_prompt = (
+        f"Original question:\n{json.dumps(original_q, ensure_ascii=False, indent=2)}\n\n"
+        "Generate the 'easier' and 'harder' variations now."
+    )
+
+    for model in VARIATION_MODELS:
+        try:
+            response = litellm.completion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.7,
+            )
+            raw = response.choices[0].message.content
+            result = _extract_json(raw)
+            if result and "easier" in result and "harder" in result:
+                return result
+            print(f"  ⚠ {model} returned invalid variation structure, trying next...")
+        except Exception as e:
+            print(f"  ⚠ {model} failed: {e}, trying next...")
+
+    print("  ❌ All variation models failed.")
+    return None
 
 def generate_docx(data, output_path):
     print("  [3/4] Creating Markdown file with LaTeX math...")
