@@ -1,0 +1,35 @@
+{
+  "original": {
+    "id": "25MATBLGBRLM01SU-000000-0246",
+    "question_text": "Bentuk sederhana dari (3^(2/3) × 8^(3/2)) / (2^(5/2) × 9^(5/6)) adalah ....",
+    "options": [
+      "1/42",
+      "2/3",
+      "4/3",
+      "6",
+      "12"
+    ]
+  },
+  "variations": {
+    "easier": {
+      "question_text": "Bentuk sederhana dari 2³ × 4² / 8¹ adalah ....",
+      "options": [
+        "2",
+        "4",
+        "8",
+        "16",
+        "32"
+      ]
+    },
+    "harder": {
+      "question_text": "Bentuk sederhana dari (27^(4/3) × 16^(3/4)) / (8^(5/3) × 9^(3/2)) adalah ....",
+      "options": [
+        "1/9",
+        "2/9",
+        "4/9",
+        "8/9",
+        "1"
+      ]
+    }
+  }
+}

@@ -1,0 +1,23 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Environment Variables (NEVER commit your API keys!)
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE folders
+.vscode/
+.idea/
+
+# Temporary files and large outputs
+*.tmp
+data/outputs/*.png
+data/outputs/*.md
+data/outputs/*.docx
+data/outputs/pages/
