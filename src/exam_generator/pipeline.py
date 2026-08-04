@@ -13,9 +13,9 @@ load_dotenv()
 
 # LiteLLM model fallback chain: tries models in order until one succeeds
 EXTRACTION_MODELS = [
-    "groq/llama-3.2-11b-vision-preview",
-    "groq/llama-3.3-70b-versatile",
-    "openai/gpt-4o-mini",
+    "groq/qwen/qwen3.6-27b",
+    "groq/meta-llama/llama-4-scout-17b-16e-instruct",
+    "groq/meta-llama/llama-4-maverick-17b-128e-instruct",
 ]
 
 VARIATION_MODELS = [
