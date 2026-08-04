@@ -1,6 +1,8 @@
 import streamlit as st
-import subprocess
 import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 st.set_page_config(page_title="Generator Variasi Soal", layout="centered")
 st.title("🎓 Generator Variasi Soal")
@@ -15,14 +17,14 @@ if uploaded_file is not None:
     if st.button(" Generate Variations", type="primary", use_container_width=True):
         with st.status("Processing PDF...", expanded=True) as status:
             st.write("Running AI pipeline...")
-            result = subprocess.run(
-                ["python", "-m", "src.exam_generator.pipeline"], 
-                capture_output=True, text=True
-            )
-            
-            if result.returncode == 0:
-                status.update(label="✅ Processing complete!", state="complete")
+            try:
+                from exam_generator.pipeline import run_pipeline
                 output_path = "data/outputs/final_pipeline_result.docx"
+                run_pipeline(
+                    pdf_path="data/inputs/uploaded_exam.pdf",
+                    output_docx=output_path,
+                )
+                status.update(label="✅ Processing complete!", state="complete")
                 if os.path.exists(output_path):
                     with open(output_path, "rb") as file:
                         st.download_button(
@@ -32,6 +34,6 @@ if uploaded_file is not None:
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                             use_container_width=True
                         )
-            else:
+            except Exception as e:
                 status.update(label="❌ Error occurred.", state="error")
-                st.error(result.stderr)
+                st.error(str(e))

@@ -3,7 +3,6 @@ import sys
 import json
 import base64
 import re
-import subprocess
 import litellm
 from dotenv import load_dotenv
 
@@ -139,51 +138,60 @@ def generate_variations(original_q):
     return None
 
 def generate_docx(data, output_path):
-    print("  [3/4] Creating Markdown file with LaTeX math...")
-    md_content = f"# Bank Soal & Variasi Matematika\n\n"
-    md_content += f"## Soal Asli (ID: {data['original']['id']})\n\n{data['original']['question_text']}\n\n"
+    print("  [3/4] Building DOCX with python-docx...")
+    from docx import Document
+    from docx.shared import Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+
+    title = doc.add_heading("Bank Soal & Variasi Matematika", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_heading(f"Soal Asli (ID: {data['original']['id']})", level=2)
+    doc.add_paragraph(data['original']['question_text'])
     for i, opt in enumerate(data['original']['options']):
-        md_content += f"{chr(65+i)}. {opt}\n"
-    
+        doc.add_paragraph(f"{chr(65+i)}. {opt}", style='List Number')
+
     for variant in ['easier', 'harder']:
         if variant in data['variations']:
-            md_content += f"\n---\n\n## Variasi Lebih {'Mudah' if variant == 'easier' else 'Sulit'}\n\n"
-            md_content += f"{data['variations'][variant]['question_text']}\n\n"
+            label = 'Mudah' if variant == 'easier' else 'Sulit'
+            doc.add_heading(f"Variasi Lebih {label}", level=2)
+            doc.add_paragraph(data['variations'][variant]['question_text'])
             for i, opt in enumerate(data['variations'][variant]['options']):
-                md_content += f"{chr(65+i)}. {opt}\n"
+                doc.add_paragraph(f"{chr(65+i)}. {opt}", style='List Number')
 
-    md_path = output_path.replace('.docx', '.md')
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(md_content)
-        
-    print("  [4/4] Converting to professional DOCX using Pandoc...")
-    subprocess.run(["pandoc", md_path, "-o", output_path, "--mathml", "-f", "markdown", "-t", "docx"], check=True)
+    doc.save(output_path)
+    print(f"  [4/4] DOCX saved to: {output_path}")
     print(f"✅ Success! Output saved to: {output_path}")
 
-def main():
+def run_pipeline(pdf_path, output_docx):
+    """Run the full pipeline: PDF -> PNG -> Extract -> Vary -> DOCX."""
+    import fitz  # PyMuPDF
+
     print("🚀 Starting End-to-End Exam Generator Pipeline...\n")
-    
-    # Paths
-    pdf_path = "data/inputs/SOAL TKA Matematika SMA 2025 Umum.pdf"
-    page_png = "data/outputs/pages/page_02.png" # Using our known good test page
-    output_docx = "data/outputs/final_pipeline_test.docx"
-    
-    if not os.path.exists(page_png):
-        print("❌ Error: Run render_pages.py first to generate PNGs.")
-        return
+
+    # Render first page of PDF to PNG
+    pages_dir = "data/outputs/pages"
+    os.makedirs(pages_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    page = doc[0]
+    pix = page.get_pixmap(dpi=200)
+    page_png = os.path.join(pages_dir, "page_01.png")
+    pix.save(page_png)
+    doc.close()
+    print(f"  ✅ Rendered page 1 to {page_png}")
 
     # 1. Extract
     original_q = extract_question_from_image(page_png)
     if not original_q:
-        print("❌ Failed to extract question.")
-        return
+        raise RuntimeError("Failed to extract question from image.")
     print(f"  ✅ Extracted: {original_q.get('id', 'Unknown ID')}")
 
     # 2. Vary
     variations = generate_variations(original_q)
     if not variations:
-        print("❌ Failed to generate variations.")
-        return
+        raise RuntimeError("Failed to generate variations.")
     print("  ✅ Variations generated.")
 
     # 3. Export
@@ -192,6 +200,15 @@ def main():
         "original": original_q,
         "variations": variations
     }, output_docx)
+
+    return output_docx
+
+
+def main():
+    run_pipeline(
+        pdf_path="data/inputs/SOAL TKA Matematika SMA 2025 Umum.pdf",
+        output_docx="data/outputs/final_pipeline_test.docx",
+    )
 
 if __name__ == "__main__":
     main()
