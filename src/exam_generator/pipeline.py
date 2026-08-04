@@ -67,6 +67,7 @@ def extract_question_from_image(image_path):
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
     ]
 
+    last_error = None
     for model in EXTRACTION_MODELS:
         try:
             response = litellm.completion(
@@ -83,10 +84,10 @@ def extract_question_from_image(image_path):
                 return result
             print(f"  ⚠ {model} returned unparseable JSON, trying next...")
         except Exception as e:
+            last_error = e
             print(f"  ⚠ {model} failed: {e}, trying next...")
 
-    print("  ❌ All extraction models failed.")
-    return None
+    raise RuntimeError(f"All extraction models failed. Last error: {last_error}")
 
 def generate_variations(original_q):
     print("  [2/4] Generating easier and harder variations via LiteLLM (with fallbacks)...")
@@ -116,6 +117,7 @@ def generate_variations(original_q):
         "Generate the 'easier' and 'harder' variations now."
     )
 
+    last_error = None
     for model in VARIATION_MODELS:
         try:
             response = litellm.completion(
@@ -132,10 +134,10 @@ def generate_variations(original_q):
                 return result
             print(f"  ⚠ {model} returned invalid variation structure, trying next...")
         except Exception as e:
+            last_error = e
             print(f"  ⚠ {model} failed: {e}, trying next...")
 
-    print("  ❌ All variation models failed.")
-    return None
+    raise RuntimeError(f"All variation models failed. Last error: {last_error}")
 
 def generate_docx(data, output_path):
     print("  [3/4] Building DOCX with python-docx...")
@@ -184,14 +186,10 @@ def run_pipeline(pdf_path, output_docx):
 
     # 1. Extract
     original_q = extract_question_from_image(page_png)
-    if not original_q:
-        raise RuntimeError("Failed to extract question from image.")
     print(f"  ✅ Extracted: {original_q.get('id', 'Unknown ID')}")
 
     # 2. Vary
     variations = generate_variations(original_q)
-    if not variations:
-        raise RuntimeError("Failed to generate variations.")
     print("  ✅ Variations generated.")
 
     # 3. Export
