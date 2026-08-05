@@ -11,6 +11,14 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 
 load_dotenv()
 
+# Fallback: load secrets from Streamlit Cloud if .env is missing
+if "GROQ_API_KEY" not in os.environ:
+    try:
+        import streamlit as st
+        os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+    except Exception:
+        pass
+
 # LiteLLM model fallback chain: tries models in order until one succeeds
 EXTRACTION_MODELS = [
     "groq/qwen/qwen3.6-27b",
