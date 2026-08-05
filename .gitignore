@@ -22,3 +22,4 @@ data/outputs/*.png
 data/outputs/*.md
 data/outputs/*.docx
 data/outputs/pages/
+data/inputs/*.pdf
