@@ -13,7 +13,12 @@ uploaded_file = st.file_uploader("Pilih file PDF", type="pdf")
 if uploaded_file is not None:
     with open("data/inputs/uploaded_exam.pdf", "wb") as f:
         f.write(uploaded_file.getbuffer())
-    
+
+    custom_instruction = st.text_area(
+        "Instruksi Tambahan (Opsional)",
+        placeholder="Contoh: Buat penyelesaian dengan konsep dasar, atau jelaskan cara cepat/trik mengerjakan soal ini...",
+    )
+
     if st.button(" Buat Variasi", type="primary", use_container_width=True):
         with st.status("Sedang memproses PDF...", expanded=True) as status:
             st.write("Menjalankan AI pipeline...")
@@ -23,6 +28,7 @@ if uploaded_file is not None:
                 run_pipeline(
                     pdf_path="data/inputs/uploaded_exam.pdf",
                     output_docx=output_path,
+                    custom_instruction=custom_instruction,
                 )
                 status.update(label="✅ Pemrosesan Selesai!", state="complete")
                 if os.path.exists(output_path):

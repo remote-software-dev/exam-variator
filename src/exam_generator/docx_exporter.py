@@ -26,6 +26,12 @@ _XML_NS = "http://www.w3.org/XML/1998/namespace"
 # Matches **bold**, *italic* and $latex$ inline spans (no nesting, no newlines).
 _INLINE_RE = re.compile(r'(\*\*[^*\n]+\*\*|\*[^*\n]+\*|\$[^$\n]+\$)')
 
+# Optional per-variation solution fields generated from user instructions.
+_SOLUTION_TITLES = {
+    "solution_by_concept": "Penyelesaian (Konsep Dasar)",
+    "solution_by_trick": "Penyelesaian (Cara Cepat/Trik)",
+}
+
 
 def _sanitize_option(text):
     """Collapse newlines inside a single option so it stays on one line."""
@@ -59,12 +65,17 @@ def build_markdown(questions):
             label = "Mudah" if variant == "easier" else "Sulit"
             if variant not in variations:
                 continue
+            vdata = variations[variant]
             lines += [f"### Variasi Lebih {label}", "",
-                      variations[variant].get("question_text", "").strip(), ""]
-            vopts = variations[variant].get("options") or []
+                      vdata.get("question_text", "").strip(), ""]
+            vopts = vdata.get("options") or []
             for i, opt in enumerate(vopts):
                 lines.append(f"- **{chr(65 + i)}.** {_sanitize_option(opt)}")
             lines.append("")
+            for key, title in _SOLUTION_TITLES.items():
+                solution = vdata.get(key)
+                if solution and solution.strip():
+                    lines += [f"**{title}:**", "", solution.strip(), ""]
 
         lines += ["---", ""]
 
@@ -277,6 +288,12 @@ def _export_with_python_docx(questions, output_path):
                 _add_rich_paragraph(
                     doc, f"**{chr(65 + i)}.** {_sanitize_option(opt)}",
                     latex_to_mathml, bullet=True)
+            for key, title in _SOLUTION_TITLES.items():
+                solution = variations[variant].get(key)
+                if solution and solution.strip():
+                    _add_rich_paragraph(
+                        doc, f"**{title}:** {solution.strip()}",
+                        latex_to_mathml)
 
     doc.save(output_path)
     print(f"  ✅ DOCX built with python-docx + latex2mathml: {output_path}")

@@ -54,7 +54,7 @@ def _extract_json(text):
             return None
     return None
 
-def extract_question_from_image(image_path):
+def extract_question_from_image(image_path, custom_instruction=None):
     print("  [1/4] Extracting question from image via LiteLLM (with fallbacks)...")
     base64_image = encode_image(image_path)
 
@@ -76,6 +76,13 @@ def extract_question_from_image(image_path):
         "- Preserve the original Indonesian language.\n"
         "- Use double quotes for all JSON keys and string values."
     )
+
+    if custom_instruction and custom_instruction.strip():
+        system_prompt += (
+            "\n\nADDITIONAL USER INSTRUCTIONS (keep them in mind and apply them "
+            "when relevant, e.g. for solution styles):\n"
+            f"{custom_instruction.strip()}"
+        )
 
     user_content = [
         {"type": "text", "text": "Extract the first complete question from this image as JSON."},
@@ -104,7 +111,7 @@ def extract_question_from_image(image_path):
 
     raise RuntimeError(f"All extraction models failed. Last error: {last_error}")
 
-def generate_variations(original_q):
+def generate_variations(original_q, custom_instruction=None):
     print("  [2/4] Generating easier and harder variations via LiteLLM (with fallbacks)...")
 
     system_prompt = (
@@ -116,6 +123,12 @@ def generate_variations(original_q):
         "- Each variation must contain:\n"
         "  * 'question_text': string (the question stem)\n"
         "  * 'options': array of exactly 5 strings (labeled A through E in the output)\n"
+        "  * 'solution_by_concept': string (optional) — the solution using the basic "
+        "concept/method, written as detailed markdown.\n"
+        "  * 'solution_by_trick': string (optional) — a quick/shortcut way to solve "
+        "it, written as detailed markdown.\n"
+        "- Only include 'solution_by_concept' / 'solution_by_trick' when the "
+        "ADDITIONAL USER INSTRUCTIONS ask for solution methods.\n"
         "- Do NOT convert multiple-choice into essay or fill-in-the-blank questions.\n"
         "- Do NOT change the number of options. Every variation MUST have exactly 5 options.\n"
         "- Do NOT include option labels (A., B., etc.) inside the option strings — just the answer text.\n"
@@ -126,6 +139,15 @@ def generate_variations(original_q):
         "- Use double quotes for all JSON keys and string values.\n"
         "- Do NOT wrap the JSON in markdown code fences."
     )
+
+    if custom_instruction and custom_instruction.strip():
+        system_prompt += (
+            "\n\nADDITIONAL USER INSTRUCTIONS (follow them exactly for every variation):\n"
+            f"{custom_instruction.strip()}\n"
+            "If these instructions ask for solution methods (e.g. 'by concept' or "
+            "'trick/cara cepat'), produce them under 'solution_by_concept' and "
+            "'solution_by_trick' using markdown (bold, lists, $LaTeX$ math)."
+        )
 
     user_prompt = (
         f"Original question:\n{json.dumps(original_q, ensure_ascii=False, indent=2)}\n\n"
@@ -154,8 +176,14 @@ def generate_variations(original_q):
 
     raise RuntimeError(f"All variation models failed. Last error: {last_error}")
 
-def run_pipeline(pdf_path, output_docx):
+def run_pipeline(pdf_path, output_docx, custom_instruction=None):
     """Run the full pipeline: PDF -> PNG -> Extract -> Vary -> DOCX.
+
+    Args:
+        pdf_path: Path to the input PDF exam paper.
+        output_docx: Where to save the generated Word document.
+        custom_instruction: Optional user-provided instructions for the LLM
+            (e.g. "Buat penyelesaian dengan konsep dasar dan cara cepat").
 
     Every page is processed independently inside a try/except so a single
     failing page (e.g. a blank page or a bad scan) is logged and skipped
@@ -185,11 +213,13 @@ def run_pipeline(pdf_path, output_docx):
             print(f"  ✅ Rendered page {i + 1} to {page_png}")
 
             # 2. Extract the question from the rendered page
-            original_q = extract_question_from_image(page_png)
+            original_q = extract_question_from_image(
+                page_png, custom_instruction=custom_instruction
+            )
             print(f"  ✅ Extracted: {original_q.get('id', 'Unknown ID')}")
 
-            # 3. Generate easier/harder variations
-            variations = generate_variations(original_q)
+            # 3. Generate easier/harder variations (plus any custom solutions)
+            variations = generate_variations(original_q, custom_instruction=custom_instruction)
             print("  ✅ Variations generated.")
 
             questions.append({
