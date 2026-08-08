@@ -9,6 +9,13 @@ from dotenv import load_dotenv
 # Add the project root to the path so we can import modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+# Import the Markdown-aware DOCX exporter (relative when run as a package,
+# absolute when this file is executed directly as a script).
+try:
+    from .docx_exporter import export_docx
+except ImportError:
+    from docx_exporter import export_docx
+
 load_dotenv()
 
 # Fallback: load secrets from Streamlit Cloud if .env is missing
@@ -147,65 +154,69 @@ def generate_variations(original_q):
 
     raise RuntimeError(f"All variation models failed. Last error: {last_error}")
 
-def generate_docx(data, output_path):
-    print("  [3/4] Building DOCX with python-docx...")
-    from docx import Document
-    from docx.shared import Pt, Inches
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    doc = Document()
-
-    title = doc.add_heading("Bank Soal & Variasi Matematika", level=1)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    doc.add_heading(f"Soal Asli (ID: {data['original']['id']})", level=2)
-    doc.add_paragraph(data['original']['question_text'])
-    for i, opt in enumerate(data['original']['options']):
-        doc.add_paragraph(f"{chr(65+i)}. {opt}", style='List Number')
-
-    for variant in ['easier', 'harder']:
-        if variant in data['variations']:
-            label = 'Mudah' if variant == 'easier' else 'Sulit'
-            doc.add_heading(f"Variasi Lebih {label}", level=2)
-            doc.add_paragraph(data['variations'][variant]['question_text'])
-            for i, opt in enumerate(data['variations'][variant]['options']):
-                doc.add_paragraph(f"{chr(65+i)}. {opt}", style='List Number')
-
-    doc.save(output_path)
-    print(f"  [4/4] DOCX saved to: {output_path}")
-    print(f"✅ Success! Output saved to: {output_path}")
-
 def run_pipeline(pdf_path, output_docx):
-    """Run the full pipeline: PDF -> PNG -> Extract -> Vary -> DOCX."""
+    """Run the full pipeline: PDF -> PNG -> Extract -> Vary -> DOCX.
+
+    Every page is processed independently inside a try/except so a single
+    failing page (e.g. a blank page or a bad scan) is logged and skipped
+    instead of crashing the whole run.
+    """
     import fitz  # PyMuPDF
 
     print("🚀 Starting End-to-End Exam Generator Pipeline...\n")
 
-    # Render first page of PDF to PNG
     pages_dir = "data/outputs/pages"
     os.makedirs(pages_dir, exist_ok=True)
+
+    questions = []
+    skipped_pages = []
+
     doc = fitz.open(pdf_path)
-    page = doc[0]
-    pix = page.get_pixmap(dpi=200)
-    page_png = os.path.join(pages_dir, "page_01.png")
-    pix.save(page_png)
+    page_count = doc.page_count
+    print(f"  📄 PDF has {page_count} page(s).")
+
+    for i in range(page_count):
+        page_label = f"page_{i + 1:02d}"
+        try:
+            # 1. Render the page to PNG
+            pix = doc[i].get_pixmap(dpi=200)
+            page_png = os.path.join(pages_dir, f"{page_label}.png")
+            pix.save(page_png)
+            print(f"  ✅ Rendered page {i + 1} to {page_png}")
+
+            # 2. Extract the question from the rendered page
+            original_q = extract_question_from_image(page_png)
+            print(f"  ✅ Extracted: {original_q.get('id', 'Unknown ID')}")
+
+            # 3. Generate easier/harder variations
+            variations = generate_variations(original_q)
+            print("  ✅ Variations generated.")
+
+            questions.append({
+                "page": i + 1,
+                "original": original_q,
+                "variations": variations,
+            })
+        except Exception as e:
+            skipped_pages.append(i + 1)
+            print(f"  ❌ Page {i + 1} failed: {e} — skipping to the next page...")
     doc.close()
-    print(f"  ✅ Rendered page 1 to {page_png}")
 
-    # 1. Extract
-    original_q = extract_question_from_image(page_png)
-    print(f"  ✅ Extracted: {original_q.get('id', 'Unknown ID')}")
+    if not questions:
+        last = f" Last error was on page {skipped_pages[-1]}." if skipped_pages else ""
+        raise RuntimeError(
+            f"Pipeline produced no questions — every page failed.{last} "
+            "Check the logs above."
+        )
 
-    # 2. Vary
-    variations = generate_variations(original_q)
-    print("  ✅ Variations generated.")
+    print(f"\n  ✅ Processed {len(questions)}/{page_count} page(s) successfully.")
+    if skipped_pages:
+        print(f"  ⚠ Skipped page(s): {skipped_pages}")
 
-    # 3. Export
-    os.makedirs(os.path.dirname(output_docx), exist_ok=True)
-    generate_docx({
-        "original": original_q,
-        "variations": variations
-    }, output_docx)
+    # 4. Export every collected question to a single Word document
+    export_docx(questions, output_docx)
+    print(f"  [4/4] DOCX saved to: {output_docx}")
+    print(f"✅ Success! Output saved to: {output_docx}")
 
     return output_docx
 
