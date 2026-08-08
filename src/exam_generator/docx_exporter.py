@@ -23,8 +23,10 @@ _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 _XML_NS = "http://www.w3.org/XML/1998/namespace"
 
-# Matches **bold**, *italic* and $latex$ inline spans (no nesting, no newlines).
-_INLINE_RE = re.compile(r'(\*\*[^*\n]+\*\*|\*[^*\n]+\*|\$[^$\n]+\$)')
+# Matches $$display$$, **bold**, *italic* and $latex$ inline spans.
+_INLINE_RE = re.compile(
+    r'(\$\$[^$]+\$\$|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\$[^$\n]+\$)'
+)
 
 # Optional per-variation solution fields generated from user instructions.
 _SOLUTION_TITLES = {
@@ -116,7 +118,9 @@ def _split_inline(text):
     for chunk in _INLINE_RE.split(text):
         if not chunk:
             continue
-        if chunk.startswith("$") and chunk.endswith("$") and len(chunk) > 2:
+        if chunk.startswith("$$") and chunk.endswith("$$") and len(chunk) > 4:
+            parts.append({"type": "math", "text": chunk[2:-2]})
+        elif chunk.startswith("$") and chunk.endswith("$") and len(chunk) > 2:
             parts.append({"type": "math", "text": chunk[1:-1]})
         elif chunk.startswith("**") and chunk.endswith("**") and len(chunk) > 4:
             parts.append({"type": "run", "text": chunk[2:-2],
@@ -146,6 +150,56 @@ def _omml_from_mathml(mathml_xml):
         """Leaf token nodes convert themselves; everything else is a container."""
         return [node] if token(node) else list(node)
 
+    _DELIM_OPEN = {"[": "[", "(": "(", "{": "{", "|": "|"}
+    _DELIM_CLOSE = {"]": "]", ")": ")", "}": "}", "|": "|"}
+
+    def _is_delimiter(node):
+        if etree.QName(node).localname != "mo":
+            return False
+        text = (node.text or "").strip()
+        return text in _DELIM_OPEN or text in _DELIM_CLOSE
+
+    def _delims_around(kids, idx):
+        beg = end = ""
+        if idx > 0 and _is_delimiter(kids[idx - 1]):
+            beg = _DELIM_OPEN.get(kids[idx - 1].text.strip(), "")
+        if idx + 1 < len(kids) and _is_delimiter(kids[idx + 1]):
+            end = _DELIM_CLOSE.get(kids[idx + 1].text.strip(), "")
+        return beg, end
+
+    def _convert_matrix(parent, node, delims=("", "")):
+        beg, end = delims
+        matrix = etree.SubElement(parent, qm("m"))
+        mpr = etree.SubElement(matrix, qm("mPr"))
+        if beg:
+            el = etree.SubElement(mpr, qm("begChr"))
+            el.set(qm("val"), beg)
+        if end:
+            el = etree.SubElement(mpr, qm("endChr"))
+            el.set(qm("val"), end)
+        mcs = etree.SubElement(mpr, qm("mcs"))
+        mc = etree.SubElement(mcs, qm("mc"))
+        mcpr = etree.SubElement(mc, qm("mcPr"))
+        first_row = next(
+            (r for r in node if etree.QName(r).localname == "mtr"), None)
+        ncols = (sum(1 for c in first_row
+                     if etree.QName(c).localname == "mtd")
+                 if first_row is not None else 1)
+        count = etree.SubElement(mcpr, qm("count"))
+        count.set(qm("val"), str(ncols))
+        jc = etree.SubElement(mcpr, qm("mcJc"))
+        jc.set(qm("val"), "center")
+        for mtr in node:
+            if etree.QName(mtr).localname != "mtr":
+                continue
+            row = etree.SubElement(matrix, qm("mr"))
+            for mtd in mtr:
+                if etree.QName(mtd).localname != "mtd":
+                    continue
+                cell = etree.SubElement(row, qm("e"))
+                for child in children_of(mtd):
+                    convert(cell, child)
+
     def convert(parent, node):
         tag = etree.QName(node).localname
         if token(node):
@@ -156,8 +210,25 @@ def _omml_from_mathml(mathml_xml):
                 t.set(f"{{{_XML_NS}}}space", "preserve")
                 t.text = text
         elif tag == "mrow":
-            for child in children_of(node):
-                convert(parent, child)
+            kids = list(node)
+            table_idx = [i for i, c in enumerate(kids)
+                         if etree.QName(c).localname == "mtable"]
+            adjacent = set()
+            for ti in table_idx:
+                if ti > 0:
+                    adjacent.add(ti - 1)
+                if ti + 1 < len(kids):
+                    adjacent.add(ti + 1)
+            for i, child in enumerate(kids):
+                ctag = etree.QName(child).localname
+                if i in adjacent and _is_delimiter(child):
+                    continue
+                if ctag == "mtable":
+                    _convert_matrix(parent, child, _delims_around(kids, i))
+                else:
+                    convert(parent, child)
+        elif tag == "mtable":
+            _convert_matrix(parent, node)
         elif tag == "mfrac":
             frac = etree.SubElement(parent, qm("f"))
             num = etree.SubElement(frac, qm("num"))

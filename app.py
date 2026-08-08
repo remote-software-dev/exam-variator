@@ -40,6 +40,40 @@ if uploaded_file is not None:
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                             use_container_width=True
                         )
+
+                # Live preview of the results (st.markdown renders $...$ LaTeX).
+                results_json = output_path.rsplit(".", 1)[0] + ".json"
+                if os.path.exists(results_json):
+                    import json as _json
+                    with open(results_json, encoding="utf-8") as f:
+                        results = _json.load(f)
+                    st.divider()
+                    st.subheader("📄 Pratinjau Hasil")
+                    for idx, q in enumerate(results.get("questions", []), 1):
+                        page_note = f" (Halaman {q['page']})" if q.get("page") else ""
+                        st.markdown(f"### Soal {idx}{page_note}")
+                        original = q.get("original", {})
+                        if original.get("id"):
+                            st.caption(f"ID: {original['id']}")
+                        st.markdown(f"**Soal Asli**\n\n{original.get('question_text', '')}")
+                        options = original.get("options") or []
+                        if options:
+                            st.markdown("**Opsi Jawaban:**")
+                            for i, opt in enumerate(options):
+                                st.markdown(f"- **{chr(65 + i)}.** {opt}")
+                        for variant in ("easier", "harder"):
+                            label = "Mudah" if variant == "easier" else "Sulit"
+                            v = q.get("variations", {}).get(variant)
+                            if not v:
+                                continue
+                            st.markdown(f"**Variasi Lebih {label}**\n\n{v.get('question_text', '')}")
+                            for i, opt in enumerate(v.get("options") or []):
+                                st.markdown(f"- **{chr(65 + i)}.** {opt}")
+                            for key, title in (("solution_by_concept", "Penyelesaian (Konsep Dasar)"),
+                                               ("solution_by_trick", "Penyelesaian (Cara Cepat/Trik)")):
+                                solution = v.get(key)
+                                if solution:
+                                    st.markdown(f"*{title}*\n\n{solution}")
             except Exception as e:
                 status.update(label="❌ Terjadi kesalahan.", state="error")
                 st.error(str(e))
