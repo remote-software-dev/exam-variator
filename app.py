@@ -73,12 +73,11 @@ def _render_preview():
         original = q.get("original", {})
         if original.get("id"):
             st.caption(f"ID: {original['id']}")
-        st.markdown(f"**Soal Asli**\n\n{original.get('question_text', '')}")
+        st.markdown(original.get("question_text", ""))
         options = original.get("options") or []
         if options:
-            st.markdown("**Opsi Jawaban:**")
             for i, opt in enumerate(options):
-                st.markdown(f"- **{chr(65 + i)}.** {opt}")
+                st.markdown(f"{chr(65 + i)}. {opt}")
         for variant in ("easier", "harder"):
             label = "Mudah" if variant == "easier" else "Sulit"
             v = q.get("variations", {}).get(variant)
