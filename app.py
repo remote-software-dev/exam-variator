@@ -8,10 +8,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 st.set_page_config(page_title="Generator Variasi Soal", layout="centered")
 st.title("🎓 Generator Variasi Soal")
-st.markdown("Unggah PDF soal ujian untuk mengekstrak semua soal secara otomatis, pilih soal yang ingin divariasikan, lalu buat variasi yang lebih mudah atau lebih sulit dan unduh hasilnya dalam bentuk Word.")
+st.markdown("Unggah PDF soal ujian untuk mengekstrak semua soal secara otomatis, meninjau pembahasan AI untuk setiap soal, lalu pilih soal yang ingin divariasikan dan unduh hasilnya dalam bentuk Word.")
 
 PDF_PATH = "data/inputs/uploaded_exam.pdf"
 OUTPUT_PATH = "data/outputs/final_pipeline_result.docx"
+
+# How much of the progress bar each phase owns, in order of execution.
+STAGE_FRACTIONS = {
+    "extract": (0.0, 0.4),
+    "solve": (0.4, 0.75),
+    "vary": (0.75, 1.0),
+}
+
+
+def _stage_frac(stage, current, total):
+    lo, hi = STAGE_FRACTIONS.get(stage, (0.0, 1.0))
+    return lo + (hi - lo) * (current / max(total, 1))
 
 
 def _render_preview():
@@ -77,13 +89,14 @@ def _save_uploaded_pdf(uploaded_file):
 
 
 def _run_extraction(custom_instruction):
-    """Phase 1: extract all questions from the uploaded PDF."""
-    from exam_generator.pipeline import extract_all_questions_from_pdf
-    with st.status("🔄 Mengekstrak Soal...", expanded=True) as status:
+    """Phase 1: extract all questions from the PDF and generate their pembahasan."""
+    from exam_generator.pipeline import extract_all_questions_from_pdf, solve_questions
+    with st.status("🔄 Mengekstrak dan Menyelesaikan Soal...", expanded=True) as status:
         progress = st.progress(0.0, text="Memulai...")
         try:
             def _on_progress(current, total, stage, message=None):
-                progress.progress(min(max(current / max(total, 1), 0.0), 1.0), text=message or "")
+                progress.progress(min(max(_stage_frac(stage, current, total), 0.0), 1.0),
+                                  text=message or "")
                 status.write(message or "")
 
             questions, skipped_pages = extract_all_questions_from_pdf(
@@ -93,11 +106,17 @@ def _run_extraction(custom_instruction):
             )
             if not questions:
                 raise RuntimeError("Tidak ada soal yang berhasil diekstrak. Cek log di atas.")
+            solve_questions(
+                questions,
+                custom_instruction=custom_instruction,
+                progress_callback=_on_progress,
+            )
             st.session_state.questions = questions
             st.session_state.skipped_pages = skipped_pages
             st.session_state.extraction_done = True
             progress.progress(1.0, text="✅ Selesai!")
-            status.update(label=f"✅ Berhasil mengekstrak {len(questions)} soal!", state="complete")
+            status.update(label=f"✅ Berhasil mengekstrak {len(questions)} soal beserta pembahasannya!",
+                          state="complete")
         except Exception as e:
             status.update(label="❌ Terjadi kesalahan.", state="error")
             st.error(str(e))
@@ -112,7 +131,8 @@ def _run_variation(custom_instruction):
             selected = st.session_state.selected_questions
 
             def _on_progress(current, total, stage, message=None):
-                progress.progress(min(max(current / max(total, 1), 0.0), 1.0), text=message or "")
+                progress.progress(min(max(_stage_frac(stage, current, total), 0.0), 1.0),
+                                  text=message or "")
                 status.write(message or "")
 
             results = generate_variation_results(
@@ -139,7 +159,7 @@ custom_instruction = st.text_area(
 )
 
 if uploaded_file is not None and not st.session_state.get("extraction_done"):
-    if st.button("📄 Ekstrak Soal", type="primary", use_container_width=True):
+    if st.button("📄 Ekstrak & Selesaikan Soal", type="primary", use_container_width=True):
         _run_extraction(custom_instruction)
 
 if st.session_state.get("extraction_done"):
@@ -150,15 +170,32 @@ if st.session_state.get("extraction_done"):
     st.subheader(f"🔍 Ditemukan {len(questions)} soal")
     if skipped_pages:
         st.warning(f"⚠ Beberapa halaman dilewati: {skipped_pages}")
+    st.caption(
+        "Tampilkan soal untuk meninjau pembahasan AI (apakah cara menyelesaikannya "
+        "sudah benar?). Centang soal yang ingin divariasikan, lalu klik 'Buat Variasi Terpilih'."
+    )
 
     for i, q in enumerate(questions):
         page_note = f" (Halaman {q['page']})" if q.get("page") else ""
-        label = q.get("question_text", "").strip()
-        st.checkbox(
-            f"Soal {i + 1}{page_note}: {label[:120]}",
-            key=f"sel_{i}",
-            value=True,
-        )
+        st.checkbox(f"Soal {i + 1}{page_note}", key=f"sel_{i}", value=True)
+        with st.expander(f"Lihat Soal {i + 1} & Pembahasan", expanded=False):
+            if q.get("id"):
+                st.caption(f"ID: {q['id']}")
+            st.markdown(q.get("question_text", ""))
+            for opt_i, opt in enumerate(q.get("options") or []):
+                st.markdown(f"{chr(65 + opt_i)}. {opt}")
+
+            concept = q.get("solution_by_concept")
+            trick = q.get("solution_by_trick")
+            if concept or trick:
+                st.markdown("---")
+                st.markdown("### 📝 Pembahasan AI")
+                if concept:
+                    st.markdown(f"**Penyelesaian (Konsep Dasar)**\n\n{concept}")
+                if trick:
+                    st.markdown(f"**Penyelesaian (Cara Cepat/Trik)**\n\n{trick}")
+            else:
+                st.warning("Pembahasan belum tersedia untuk soal ini.")
 
     if st.button("🚀 Buat Variasi Terpilih", type="primary", use_container_width=True):
         selected = [

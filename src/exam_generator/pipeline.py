@@ -40,6 +40,13 @@ VARIATION_MODELS = [
     "openai/gpt-4o-mini",
 ]
 
+# Models used to generate the solution discussion (pembahasan) shown in the
+# preview so the user can verify how the AI solves each question.
+SOLUTION_MODELS = [
+    "groq/llama-3.3-70b-versatile",
+    "openai/gpt-4o-mini",
+]
+
 # Pause between pages to stay under the Groq free-tier TPM rate limit.
 EXTRACTION_DELAY_SECONDS = 2.0
 
@@ -256,6 +263,100 @@ def generate_variations(original_q, custom_instruction=None):
             print(f"  ⚠ {model} failed: {e}, trying next...")
 
     raise RuntimeError(f"All variation models failed. Last error: {last_error}")
+
+def generate_solution(original_q, custom_instruction=None):
+    """Generate a solution discussion (pembahasan) for a single question.
+
+    Returns a dict with 'solution_by_concept' and 'solution_by_trick' keys
+    (mirroring the variation format so rendering can be reused).
+    """
+    print("  Generating solution discussion (pembahasan) via LiteLLM (with fallbacks)...")
+
+    system_prompt = (
+        "You are an expert math teacher for Indonesian secondary schools.\n"
+        "Given a question, produce a clear, step-by-step solution discussion "
+        "(pembahasan) that teaches the student HOW to solve it.\n\n"
+        "STRICT FORMAT RULES:\n"
+        "- Return ONLY a valid JSON object.\n"
+        "- Top-level keys: 'solution_by_concept' and 'solution_by_trick'.\n"
+        "  * 'solution_by_concept': string — the full solution using the basic "
+        "concept/method, step by step, written as detailed markdown.\n"
+        "  * 'solution_by_trick': string — a quick/shortcut way to solve it, "
+        "written as detailed markdown. If no real shortcut exists, restate the "
+        "most efficient approach.\n"
+        "- Explain every step and the reasoning behind each transformation; "
+        "state the final answer (key answer) explicitly.\n"
+        "- Use LaTeX math notation enclosed in $ delimiters for all formulas.\n"
+        f"- {MATRIX_FORMATTING_RULES}\n"
+        "- Preserve the original Indonesian language.\n"
+        "- Use double quotes for all JSON keys and string values.\n"
+        "- Do NOT wrap the JSON in markdown code fences."
+    )
+
+    if custom_instruction and custom_instruction.strip():
+        system_prompt += (
+            "\n\nADDITIONAL USER INSTRUCTIONS (follow them exactly):\n"
+            f"{custom_instruction.strip()}\n"
+            "If these instructions ask for a specific solution style (e.g. 'by "
+            "concept' or 'trick/cara cepat'), emphasize and clearly label that "
+            "style in the corresponding field."
+        )
+
+    user_prompt = (
+        f"Question:\n{json.dumps(original_q, ensure_ascii=False, indent=2)}\n\n"
+        "Generate the solution discussion (pembahasan) now."
+    )
+
+    last_error = None
+    for model in SOLUTION_MODELS:
+        try:
+            response = litellm.completion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+            )
+            raw = response.choices[0].message.content
+            result = _extract_json(raw)
+            if result and any(
+                k in result for k in ("solution_by_concept", "solution_by_trick")
+            ):
+                return result
+            print(f"  ⚠ {model} returned invalid solution structure, trying next...")
+        except Exception as e:
+            last_error = e
+            print(f"  ⚠ {model} failed: {e}, trying next...")
+
+    raise RuntimeError(f"All solution models failed. Last error: {last_error}")
+
+def solve_questions(questions, custom_instruction=None, progress_callback=None):
+    """Generate a solution discussion (pembahasan) for every question in place.
+
+    Each question dict gains 'solution_by_concept' and 'solution_by_trick' keys
+    so the preview can show the AI explanation next to the raw question text.
+
+    Args:
+        progress_callback: Optional callable(current, total, stage, message).
+            Called after every question; stage is "solve".
+
+    Returns the same (mutated) list of questions.
+    """
+    total = len(questions)
+    for done, q in enumerate(questions, 1):
+        solution = generate_solution(q, custom_instruction=custom_instruction)
+        q["solution_by_concept"] = solution.get("solution_by_concept", "")
+        q["solution_by_trick"] = solution.get("solution_by_trick", "")
+        print(f"  ✅ Solution generated for '{q.get('id', 'Unknown ID')}'")
+        if progress_callback:
+            progress_callback(
+                done,
+                total,
+                "solve",
+                f"Membuat pembahasan soal {done} dari {total}...",
+            )
+    return questions
 
 def extract_all_questions_from_pdf(pdf_path, custom_instruction=None, progress_callback=None):
     """Render each page to PNG and extract ALL questions from every page.
