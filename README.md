@@ -1,25 +1,25 @@
-# 🎓 Generator Variasi Soal (Exam Variator)
+# 🎓 Exam Variator (Generator Variasi Soal)
 
-Otomatis mengekstrak soal ujian matematika dari PDF, membuat variasi soal yang lebih mudah dan lebih sulit dengan AI, lalu mengekspor hasilnya ke dokumen Word.
+Automatically extracts math exam questions from PDF, generates easier and harder variations with AI, and exports the results to a Word document.
 
-## Fitur
+## Features
 
-- **Ekstraksi semua soal** — setiap halaman PDF dirender menjadi gambar lalu diproses AI untuk mengekstrak *semua* soal (bukan hanya satu soal per halaman).
-- **Variasi AI** — untuk setiap soal dibuat 2 variasi: *lebih mudah* dan *lebih sulit*, dengan 5 opsi jawaban (A–E).
-- **Pemrosesan bertahap (5-by-5)** — soal diproses dalam kelompok 5. Setelah setiap kelompok, muncul popup untuk melanjutkan 5 soal berikutnya atau berhenti dan memakai hasil yang sudah ada.
-- **Format matriks LaTeX yang ketat** — prompt AI mewajibkan `\begin{bmatrix} ... \end{bmatrix}` (dengan *few-shot example*) agar matriks tidak pernah dirender sebagai `|`, `||`, `∨`, atau array teks polos.
-- **Instruksi kustom** — tambahkan instruksi seperti "buat penyelesaian dengan konsep dasar dan cara cepat" untuk menghasilkan `solution_by_concept` dan `solution_by_trick`.
-- **Ekspor Word** — DOCX dihasilkan melalui pandoc (`--mathml`) agar LaTeX menjadi persamaan Word asli; fallback ke python-docx + latex2mathml jika pandoc tidak tersedia.
-- **Pratinjau hasil** — preview soal asli dan variasi langsung di UI (render `$...$` LaTeX).
+- **Extract all questions** — every PDF page is rendered to an image and processed by AI to extract *all* questions (not just one per page).
+- **AI variations** — each question gets 2 variations: *easier* and *harder*, each with 5 answer options (A–E).
+- **Batch processing (5-by-5)** — questions are processed in groups of 5. After each group a popup asks whether to continue with the next 5 questions or stop and keep the results so far.
+- **Strict LaTeX matrix formatting** — the AI prompt enforces `\begin{bmatrix} ... \end{bmatrix}` (with a few-shot example) so matrices are never rendered as `|`, `||`, `∨`, or plain-text arrays.
+- **Custom instructions** — add instructions like "provide solutions using the basic concept and a quick trick" to generate `solution_by_concept` and `solution_by_trick`.
+- **Word export** — the DOCX is produced via pandoc (`--mathml`) so LaTeX becomes native Word equations; falls back to python-docx + latex2mathml when pandoc is unavailable.
+- **Results preview** — preview the original questions and variations right in the UI (renders `$...$` LaTeX).
 
-## Arsitektur Pipeline
+## Pipeline
 
 ```
-PDF ──► PNG (per halaman) ──► Ekstrak semua soal (LLM vision)
-        ──► Variasi 5-by-5 (LLM) ──► Ekspor DOCX + JSON sidecar
+PDF ──► PNG (per page) ──► Extract all questions (LLM vision)
+       ──► 5-by-5 variations (LLM) ──► Export DOCX + JSON sidecar
 ```
 
-## Instalasi
+## Installation
 
 ```bash
 git clone git@github.com:remote-software-dev/exam-variator.git
@@ -29,50 +29,50 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Salin `.env.example` ke `.env` dan isi kunci API (fallback ke Streamlit Cloud secrets juga didukung):
+Copy `.env.example` to `.env` and fill in your API key (Streamlit Cloud secrets are also supported as a fallback):
 
 ```bash
 GROQ_API_KEY=your-key-here
 ```
 
-## Menjalankan UI (Streamlit)
+## Run the UI (Streamlit)
 
 ```bash
 streamlit run app.py
 ```
 
-1. Unggah PDF soal ujian.
-2. (Opsional) tulis instruksi tambahan.
-3. Klik **Buat Variasi**.
-4. Setelah tiap 5 soal, pilih **Lanjutkan ➡️** atau **Selesai**.
-5. Unduh dokumen Word hasil akhir.
+1. Upload the exam PDF.
+2. (Optional) add custom instructions.
+3. Click **Buat Variasi** (Generate Variations).
+4. After every 5 questions choose **Lanjutkan ➡️** (Continue) or **Selesai** (Finish).
+5. Download the resulting Word document.
 
-## Menjalankan via CLI
+## Run via CLI
 
 ```bash
 python -m src.exam_generator.pipeline
 ```
 
-`run_pipeline()` juga bisa dipanggil langsung dan mendukung `batch_size` serta `continue_callback(processed, total) -> bool` untuk menghentikan proses lebih awal.
+`run_pipeline()` can also be called directly and supports `batch_size` and a `continue_callback(processed, total) -> bool` to stop processing early.
 
-## Struktur Proyek
+## Project Structure
 
 ```
-app.py                          # UI Streamlit (upload, batch 5-by-5, pratinjau)
+app.py                          # Streamlit UI (upload, 5-by-5 batching, preview)
 src/exam_generator/
-  pipeline.py                   # ekstraksi soal, generasi variasi, orkestrasi batch
-  docx_exporter.py              # ekspor DOCX (pandoc → fallback python-docx)
+  pipeline.py                   # question extraction, variation generation, batch orchestration
+  docx_exporter.py              # DOCX export (pandoc → python-docx fallback)
 scripts/
-  structure_questions.py        # utilitas strukturisasi soal dari teks PDF
-  render_pages.py               # render halaman PDF menjadi PNG
+  structure_questions.py        # utility to structure questions from PDF text
+  render_pages.py               # render PDF pages to PNG
 data/
-  inputs/                       # PDF masukan
-  outputs/                      # DOCX, PNG halaman, JSON sidecar
+  inputs/                       # input PDFs
+  outputs/                      # DOCX, page PNGs, JSON sidecar
 ```
 
-## Model AI (fallback chain)
+## AI Models (fallback chain)
 
-- **Ekstraksi:** `groq/qwen/qwen3.6-27b` → `groq/meta-llama/llama-4-scout-17b-16e-instruct` → `groq/meta-llama/llama-4-maverick-17b-128e-instruct`
-- **Variasi:** `groq/llama-3.3-70b-versatile` → `openai/gpt-4o-mini`
+- **Extraction:** `groq/qwen/qwen3.6-27b` → `groq/meta-llama/llama-4-scout-17b-16e-instruct` → `groq/meta-llama/llama-4-maverick-17b-128e-instruct`
+- **Variation:** `groq/llama-3.3-70b-versatile` → `openai/gpt-4o-mini`
 
-Daftar model dapat disesuaikan di `src/exam_generator/pipeline.py`.
+The model lists can be customized in `src/exam_generator/pipeline.py`.
