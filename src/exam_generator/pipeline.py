@@ -42,6 +42,17 @@ def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
+MATRIX_FORMATTING_RULES = (
+    "STRICT MATRIX FORMATTING RULES:\n"
+    "1. NEVER use '|', '||', '∨', or plain text arrays for matrices.\n"
+    "2. You MUST use standard LaTeX matrix environments: "
+    "\\begin{bmatrix} ... \\end{bmatrix} (entries separated by &, "
+    "rows separated by \\\\).\n"
+    "3. FEW-SHOT EXAMPLE: If the matrix is F = [[2, 0], [0, 1/2]], "
+    "you MUST output exactly: "
+    "\\begin{bmatrix} 2 & 0 \\\\ 0 & \\frac{1}{2} \\end{bmatrix}"
+)
+
 def _extract_json(text):
     """Robustly extract the first JSON object from model output."""
     match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
@@ -64,12 +75,7 @@ def extract_question_from_image(image_path, custom_instruction=None):
         "RULES:\n"
         "- Use LaTeX math notation enclosed in $ delimiters for all formulas "
         "(e.g., $\\frac{a}{b}$, $x^2$, $\\sqrt{3}$).\n"
-        "- NEVER use '|', '||', '∨', or plain text arrays for matrices.\n"
-        "- You MUST use standard LaTeX matrix environments: "
-        "\\begin{bmatrix} ... \\end{bmatrix} (entries separated by &, "
-        "rows separated by \\\\).\n"
-        "- Example: If the matrix is F = [[2, 0], [0, 1/2]], you MUST output exactly: "
-        "\\begin{bmatrix} 2 & 0 \\\\ 0 & \\frac{1}{2} \\end{bmatrix}\n"
+        f"- {MATRIX_FORMATTING_RULES}\n"
         "- 'id' must be the alphanumeric ID printed on the paper (e.g., '25MATBLGBRLM01SU-000000-0246').\n"
         "  If no ID is visible or the ID is just a number like '1', generate a unique one: "
         "'EXAM-<RANDOM8HEX>'.\n"
@@ -139,12 +145,7 @@ def generate_variations(original_q, custom_instruction=None):
         "- Do NOT change the number of options. Every variation MUST have exactly 5 options.\n"
         "- Do NOT include option labels (A., B., etc.) inside the option strings — just the answer text.\n"
         "- Use LaTeX math notation enclosed in $ delimiters for all formulas.\n"
-        "- NEVER use '|', '||', '∨', or plain text arrays for matrices.\n"
-        "- You MUST use standard LaTeX matrix environments: "
-        "\\begin{bmatrix} ... \\end{bmatrix} (entries separated by &, "
-        "rows separated by \\\\).\n"
-        "- Example: If the matrix is F = [[2, 0], [0, 1/2]], you MUST output exactly: "
-        "\\begin{bmatrix} 2 & 0 \\\\ 0 & \\frac{1}{2} \\end{bmatrix}\n"
+        f"- {MATRIX_FORMATTING_RULES}\n"
         "- Keep the same mathematical topic and difficulty relative to the label (easier = simpler numbers/steps, "
         "harder = more complex numbers/steps or additional concepts).\n"
         "- Preserve the original Indonesian language.\n"
