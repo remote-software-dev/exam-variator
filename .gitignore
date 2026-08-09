@@ -21,5 +21,6 @@ __pycache__/
 data/outputs/*.png
 data/outputs/*.md
 data/outputs/*.docx
+data/outputs/*.json
 data/outputs/pages/
 data/inputs/*.pdf
