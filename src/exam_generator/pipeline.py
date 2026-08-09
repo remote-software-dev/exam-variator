@@ -65,13 +65,24 @@ def _extract_json(text):
             return None
     return None
 
-def extract_question_from_image(image_path, custom_instruction=None):
-    print("  [1/4] Extracting question from image via LiteLLM (with fallbacks)...")
-    base64_image = encode_image(image_path)
+def _extraction_system_prompt(custom_instruction, all_questions):
+    """Build the shared system prompt for the (single/all) extraction tasks."""
+    if all_questions:
+        intro = (
+            "You are an expert at extracting Indonesian math exam questions from scanned images.\n"
+            "Return ONLY a valid JSON object with a single key 'questions', which is a list "
+            "of question objects. Each question object has keys: 'id', 'question_text', "
+            "'options' (list of strings).\n\n"
+            "Extract EVERY complete question visible on the image — do not skip, merge, or "
+            "leave out any question.\n\n"
+        )
+    else:
+        intro = (
+            "You are an expert at extracting Indonesian math exam questions from scanned images.\n"
+            "Return ONLY a valid JSON object with keys: 'id', 'question_text', 'options' (list of strings).\n\n"
+        )
 
-    system_prompt = (
-        "You are an expert at extracting Indonesian math exam questions from scanned images.\n"
-        "Return ONLY a valid JSON object with keys: 'id', 'question_text', 'options' (list of strings).\n\n"
+    rules = (
         "RULES:\n"
         "- Use LaTeX math notation enclosed in $ delimiters for all formulas "
         "(e.g., $\\frac{a}{b}$, $x^2$, $\\sqrt{3}$).\n"
@@ -90,31 +101,34 @@ def extract_question_from_image(image_path, custom_instruction=None):
     )
 
     if custom_instruction and custom_instruction.strip():
-        system_prompt += (
+        rules += (
             "\n\nADDITIONAL USER INSTRUCTIONS (keep them in mind and apply them "
             "when relevant, e.g. for solution styles):\n"
             f"{custom_instruction.strip()}"
         )
 
-    user_content = [
-        {"type": "text", "text": "Extract the first complete question from this image as JSON."},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
-    ]
+    return intro + rules
 
+
+def _extract_via_llm(system_prompt, user_text, models, min_keys=None):
+    """Run the extraction prompt against the model fallback chain."""
     last_error = None
-    for model in EXTRACTION_MODELS:
+    for model in models:
         try:
             response = litellm.completion(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
+                    {"role": "user", "content": user_text},
                 ],
                 temperature=0.1,
             )
             raw = response.choices[0].message.content
             result = _extract_json(raw)
             if result:
+                if min_keys and any(k not in result for k in min_keys):
+                    print(f"  ⚠ {model} returned incomplete JSON, trying next...")
+                    continue
                 return result
             print(f"  ⚠ {model} returned unparseable JSON, trying next...")
         except Exception as e:
@@ -122,6 +136,55 @@ def extract_question_from_image(image_path, custom_instruction=None):
             print(f"  ⚠ {model} failed: {e}, trying next...")
 
     raise RuntimeError(f"All extraction models failed. Last error: {last_error}")
+
+
+def extract_question_from_image(image_path, custom_instruction=None):
+    print("  [1/4] Extracting question from image via LiteLLM (with fallbacks)...")
+    base64_image = encode_image(image_path)
+
+    system_prompt = _extraction_system_prompt(custom_instruction, all_questions=False)
+
+    user_content = [
+        {"type": "text", "text": "Extract the first complete question from this image as JSON."},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+    ]
+
+    return _extract_via_llm(
+        system_prompt,
+        user_content,
+        EXTRACTION_MODELS,
+        min_keys=["id", "question_text"],
+    )
+
+
+def extract_all_questions_from_image(image_path, custom_instruction=None):
+    """Extract ALL complete questions from an image. Returns a list of question dicts."""
+    print("  Extracting ALL questions from image via LiteLLM (with fallbacks)...")
+    base64_image = encode_image(image_path)
+
+    system_prompt = _extraction_system_prompt(custom_instruction, all_questions=True)
+
+    user_content = [
+        {"type": "text", "text": "Extract ALL complete questions from this image as JSON."},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+    ]
+
+    result = _extract_via_llm(
+        system_prompt,
+        user_content,
+        EXTRACTION_MODELS,
+        min_keys=["questions"],
+    )
+
+    if isinstance(result.get("questions"), list):
+        questions = [q for q in result["questions"]
+                     if isinstance(q, dict) and q.get("question_text")]
+        if questions:
+            return questions
+
+    raise RuntimeError(
+        "Extraction model returned no valid questions for this image."
+    )
 
 def generate_variations(original_q, custom_instruction=None):
     print("  [2/4] Generating easier and harder variations via LiteLLM (with fallbacks)...")
@@ -189,22 +252,15 @@ def generate_variations(original_q, custom_instruction=None):
 
     raise RuntimeError(f"All variation models failed. Last error: {last_error}")
 
-def run_pipeline(pdf_path, output_docx, custom_instruction=None):
-    """Run the full pipeline: PDF -> PNG -> Extract -> Vary -> DOCX.
+def extract_all_questions_from_pdf(pdf_path, custom_instruction=None):
+    """Render each page to PNG and extract ALL questions from every page.
 
-    Args:
-        pdf_path: Path to the input PDF exam paper.
-        output_docx: Where to save the generated Word document.
-        custom_instruction: Optional user-provided instructions for the LLM
-            (e.g. "Buat penyelesaian dengan konsep dasar dan cara cepat").
-
-    Every page is processed independently inside a try/except so a single
-    failing page (e.g. a blank page or a bad scan) is logged and skipped
-    instead of crashing the whole run.
+    Returns (questions, skipped_pages). Each question dict carries its page number
+    under the 'page' key so batching can keep results page-aware.
     """
     import fitz  # PyMuPDF
 
-    print("🚀 Starting End-to-End Exam Generator Pipeline...\n")
+    print("  📄 Rendering pages and extracting ALL questions...")
 
     pages_dir = "data/outputs/pages"
     os.makedirs(pages_dir, exist_ok=True)
@@ -219,42 +275,93 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None):
     for i in range(page_count):
         page_label = f"page_{i + 1:02d}"
         try:
-            # 1. Render the page to PNG
             pix = doc[i].get_pixmap(dpi=200)
             page_png = os.path.join(pages_dir, f"{page_label}.png")
             pix.save(page_png)
             print(f"  ✅ Rendered page {i + 1} to {page_png}")
 
-            # 2. Extract the question from the rendered page
-            original_q = extract_question_from_image(
+            page_questions = extract_all_questions_from_image(
                 page_png, custom_instruction=custom_instruction
             )
-            print(f"  ✅ Extracted: {original_q.get('id', 'Unknown ID')}")
-
-            # 3. Generate easier/harder variations (plus any custom solutions)
-            variations = generate_variations(original_q, custom_instruction=custom_instruction)
-            print("  ✅ Variations generated.")
-
-            questions.append({
-                "page": i + 1,
-                "original": original_q,
-                "variations": variations,
-            })
+            for q in page_questions:
+                q.setdefault("page", i + 1)
+            print(f"  ✅ Extracted {len(page_questions)} question(s) from page {i + 1}")
+            questions.extend(page_questions)
         except Exception as e:
             skipped_pages.append(i + 1)
             print(f"  ❌ Page {i + 1} failed: {e} — skipping to the next page...")
     doc.close()
 
-    if not questions:
+    return questions, skipped_pages
+
+
+def generate_variation_batch(questions, start, batch_size, custom_instruction=None):
+    """Generate easier/harder variations for questions[start:start + batch_size].
+
+    Returns a list of result items with the same shape the DOCX exporter expects:
+    {"page": ..., "original": ..., "variations": ...}.
+    """
+    results = []
+    for original_q in questions[start:start + batch_size]:
+        variations = generate_variations(original_q, custom_instruction=custom_instruction)
+        results.append({
+            "page": original_q.get("page"),
+            "original": original_q,
+            "variations": variations,
+        })
+        print(f"  ✅ Variations generated for '{original_q.get('id', 'Unknown ID')}'")
+    return results
+
+
+def run_pipeline(pdf_path, output_docx, custom_instruction=None,
+                 batch_size=5, continue_callback=None):
+    """Run the full pipeline: PDF -> PNG -> Extract (all questions) -> Vary -> DOCX.
+
+    Args:
+        pdf_path: Path to the input PDF exam paper.
+        output_docx: Where to save the generated Word document.
+        custom_instruction: Optional user-provided instructions for the LLM
+            (e.g. "Buat penyelesaian dengan konsep dasar dan cara cepat").
+        batch_size: How many questions are varied per batch before pausing.
+        continue_callback: Optional callable(processed_count, total_count) -> bool.
+            Called after every batch once at least one batch has completed; return
+            False to stop early and export only the questions processed so far.
+            When None (e.g. CLI), the whole exam is processed without pausing.
+
+    Every page is processed independently inside a try/except so a single
+    failing page (e.g. a blank page or a bad scan) is logged and skipped
+    instead of crashing the whole run.
+    """
+    print("🚀 Starting End-to-End Exam Generator Pipeline...\n")
+
+    all_questions, skipped_pages = extract_all_questions_from_pdf(
+        pdf_path, custom_instruction=custom_instruction
+    )
+
+    if not all_questions:
         last = f" Last error was on page {skipped_pages[-1]}." if skipped_pages else ""
         raise RuntimeError(
             f"Pipeline produced no questions — every page failed.{last} "
             "Check the logs above."
         )
 
-    print(f"\n  ✅ Processed {len(questions)}/{page_count} page(s) successfully.")
+    total = len(all_questions)
+    print(f"\n  ✅ Extracted {total} question(s). "
+          f"Generating variations in batches of {batch_size}...")
     if skipped_pages:
         print(f"  ⚠ Skipped page(s): {skipped_pages}")
+
+    questions = []
+    for start in range(0, total, batch_size):
+        questions.extend(generate_variation_batch(
+            all_questions, start, batch_size, custom_instruction=custom_instruction
+        ))
+        processed = len(questions)
+        print(f"  ✅ Variations generated for {processed}/{total} question(s).")
+        if continue_callback and processed < total:
+            if not continue_callback(processed, total):
+                print("  ⏹ Processing stopped by user callback — exporting partial results.")
+                break
 
     # 4. Export every collected question to a single Word document
     export_docx(questions, output_docx)
@@ -265,7 +372,7 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None):
         json.dump({"questions": questions}, f, ensure_ascii=False, indent=2)
 
     print(f"  [4/4] DOCX saved to: {output_docx}")
-    print(f"✅ Success! Output saved to: {output_docx}")
+    print(f"✅ Success! {len(questions)}/{total} question(s) exported to: {output_docx}")
 
     return output_docx
 
