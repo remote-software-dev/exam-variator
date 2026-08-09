@@ -3,6 +3,7 @@ import sys
 import json
 import base64
 import re
+import time
 import litellm
 from dotenv import load_dotenv
 
@@ -26,17 +27,21 @@ if "GROQ_API_KEY" not in os.environ:
     except Exception:
         pass
 
-# LiteLLM model fallback chain: tries models in order until one succeeds
+# LiteLLM model fallback chain: tries models in order until one succeeds.
+# Primary first, then widely-available Groq fallbacks.
 EXTRACTION_MODELS = [
     "groq/qwen/qwen3.6-27b",
-    "groq/meta-llama/llama-4-scout-17b-16e-instruct",
-    "groq/meta-llama/llama-4-maverick-17b-128e-instruct",
+    "groq/llama-3.1-70b-versatile",
+    "groq/llama3-8b-8192",
 ]
 
 VARIATION_MODELS = [
     "groq/llama-3.3-70b-versatile",
     "openai/gpt-4o-mini",
 ]
+
+# Pause between pages to stay under the Groq free-tier TPM rate limit.
+EXTRACTION_DELAY_SECONDS = 2.0
 
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
@@ -252,8 +257,14 @@ def generate_variations(original_q, custom_instruction=None):
 
     raise RuntimeError(f"All variation models failed. Last error: {last_error}")
 
-def extract_all_questions_from_pdf(pdf_path, custom_instruction=None):
+def extract_all_questions_from_pdf(pdf_path, custom_instruction=None, progress_callback=None):
     """Render each page to PNG and extract ALL questions from every page.
+
+    Args:
+        pdf_path: Path to the input PDF exam paper.
+        custom_instruction: Optional user-provided instructions for the LLM.
+        progress_callback: Optional callable(current, total, stage, message).
+            Called after each page is extracted; stage is "extract".
 
     Returns (questions, skipped_pages). Each question dict carries its page number
     under the 'page' key so batching can keep results page-aware.
@@ -287,6 +298,20 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None):
                 q.setdefault("page", i + 1)
             print(f"  ✅ Extracted {len(page_questions)} question(s) from page {i + 1}")
             questions.extend(page_questions)
+
+            if progress_callback:
+                progress_callback(
+                    i + 1,
+                    page_count,
+                    "extract",
+                    f"Sedang mengekstrak soal dari halaman {i + 1} dari {page_count}...",
+                )
+
+            # Throttle between pages to avoid hitting the Groq free-tier
+            # 8000 TPM rate limit when processing many pages.
+            if i + 1 < page_count:
+                print(f"  ⏳ Waiting {EXTRACTION_DELAY_SECONDS}s to respect the rate limit...")
+                time.sleep(EXTRACTION_DELAY_SECONDS)
         except Exception as e:
             skipped_pages.append(i + 1)
             print(f"  ❌ Page {i + 1} failed: {e} — skipping to the next page...")
@@ -295,14 +320,21 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None):
     return questions, skipped_pages
 
 
-def generate_variation_batch(questions, start, batch_size, custom_instruction=None):
+def generate_variation_batch(questions, start, batch_size, custom_instruction=None,
+                             progress_callback=None):
     """Generate easier/harder variations for questions[start:start + batch_size].
+
+    Args:
+        progress_callback: Optional callable(current, total, stage, message).
+            Called after every question; stage is "vary" and current is the
+            global question index across the whole exam.
 
     Returns a list of result items with the same shape the DOCX exporter expects:
     {"page": ..., "original": ..., "variations": ...}.
     """
     results = []
-    for original_q in questions[start:start + batch_size]:
+    total = len(questions)
+    for offset, original_q in enumerate(questions[start:start + batch_size]):
         variations = generate_variations(original_q, custom_instruction=custom_instruction)
         results.append({
             "page": original_q.get("page"),
@@ -310,11 +342,19 @@ def generate_variation_batch(questions, start, batch_size, custom_instruction=No
             "variations": variations,
         })
         print(f"  ✅ Variations generated for '{original_q.get('id', 'Unknown ID')}'")
+        if progress_callback:
+            done = start + offset + 1
+            progress_callback(
+                done,
+                total,
+                "vary",
+                f"Membuat variasi soal {done} dari {total}...",
+            )
     return results
 
 
 def run_pipeline(pdf_path, output_docx, custom_instruction=None,
-                 batch_size=5, continue_callback=None):
+                 batch_size=5, continue_callback=None, progress_callback=None):
     """Run the full pipeline: PDF -> PNG -> Extract (all questions) -> Vary -> DOCX.
 
     Args:
@@ -322,11 +362,15 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
         output_docx: Where to save the generated Word document.
         custom_instruction: Optional user-provided instructions for the LLM
             (e.g. "Buat penyelesaian dengan konsep dasar dan cara cepat").
-        batch_size: How many questions are varied per batch before pausing.
+        batch_size: How many questions are varied per batch.
         continue_callback: Optional callable(processed_count, total_count) -> bool.
             Called after every batch once at least one batch has completed; return
             False to stop early and export only the questions processed so far.
             When None (e.g. CLI), the whole exam is processed without pausing.
+        progress_callback: Optional callable(current, total, stage, message) where
+            stage is "extract" (current/total = page X of N) or "vary"
+            (current/total = question X of N). Used by the UI to drive a live
+            progress bar.
 
     Every page is processed independently inside a try/except so a single
     failing page (e.g. a blank page or a bad scan) is logged and skipped
@@ -335,7 +379,9 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
     print("🚀 Starting End-to-End Exam Generator Pipeline...\n")
 
     all_questions, skipped_pages = extract_all_questions_from_pdf(
-        pdf_path, custom_instruction=custom_instruction
+        pdf_path,
+        custom_instruction=custom_instruction,
+        progress_callback=progress_callback,
     )
 
     if not all_questions:
@@ -354,7 +400,9 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
     questions = []
     for start in range(0, total, batch_size):
         questions.extend(generate_variation_batch(
-            all_questions, start, batch_size, custom_instruction=custom_instruction
+            all_questions, start, batch_size,
+            custom_instruction=custom_instruction,
+            progress_callback=progress_callback,
         ))
         processed = len(questions)
         print(f"  ✅ Variations generated for {processed}/{total} question(s).")
