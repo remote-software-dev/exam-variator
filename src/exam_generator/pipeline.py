@@ -6,6 +6,7 @@ import re
 import time
 import litellm
 from dotenv import load_dotenv
+from litellm.exceptions import RateLimitError
 
 # Add the project root to the path so we can import modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -31,8 +32,9 @@ if "GROQ_API_KEY" not in os.environ:
 # Primary first, then widely-available Groq fallbacks.
 EXTRACTION_MODELS = [
     "groq/qwen/qwen3.6-27b",
-    "groq/llama-3.1-70b-versatile",
-    "groq/llama3-8b-8192",
+    "groq/llama-3.3-70b-versatile",
+    "groq/llama-3.1-8b-instant",
+    "groq/gemma2-9b-it",
 ]
 
 VARIATION_MODELS = [
@@ -48,7 +50,34 @@ SOLUTION_MODELS = [
 ]
 
 # Pause between pages to stay under the Groq free-tier TPM rate limit.
-EXTRACTION_DELAY_SECONDS = 2.0
+EXTRACTION_DELAY_SECONDS = 10.0
+
+# On a RateLimitError, retry the SAME model (rather than falling back) after
+# this delay, up to this many attempts.
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_RETRY_DELAY_SECONDS = 15.0
+
+
+def _completion_with_retry(model, messages, **kwargs):
+    """Call litellm.completion, retrying the same model on RateLimitError.
+
+    Any other exception propagates to the caller so its own fallback logic
+    (trying the next model) still applies.
+    """
+    for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return litellm.completion(model=model, messages=messages, **kwargs)
+        except RateLimitError as e:
+            if attempt == RATE_LIMIT_MAX_RETRIES:
+                raise
+            print(
+                f"  ⏳ Rate limit hit for {model}; sleeping "
+                f"{RATE_LIMIT_RETRY_DELAY_SECONDS}s, retrying "
+                f"{attempt}/{RATE_LIMIT_MAX_RETRIES}..."
+            )
+            time.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
+
+    raise RuntimeError("unreachable")
 
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
@@ -127,7 +156,7 @@ def _extract_via_llm(system_prompt, user_text, models, min_keys=None):
     last_error = None
     for model in models:
         try:
-            response = litellm.completion(
+            response = _completion_with_retry(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -245,7 +274,7 @@ def generate_variations(original_q, custom_instruction=None):
     last_error = None
     for model in VARIATION_MODELS:
         try:
-            response = litellm.completion(
+            response = _completion_with_retry(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -310,7 +339,7 @@ def generate_solution(original_q, custom_instruction=None):
     last_error = None
     for model in SOLUTION_MODELS:
         try:
-            response = litellm.completion(
+            response = _completion_with_retry(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
