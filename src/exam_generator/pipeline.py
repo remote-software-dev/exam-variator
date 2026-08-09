@@ -353,6 +353,50 @@ def generate_variation_batch(questions, start, batch_size, custom_instruction=No
     return results
 
 
+def generate_variation_results(questions, custom_instruction=None, progress_callback=None):
+    """Generate easier/harder variations for an already-selected list of questions.
+
+    Args:
+        questions: The questions (already selected by the user) to process.
+        custom_instruction: Optional user-provided instructions for the LLM.
+        progress_callback: Optional callable(current, total, stage, message).
+            Called after every question; stage is "vary".
+
+    Returns a list of result items with the same shape the DOCX exporter expects:
+    {"page": ..., "original": ..., "variations": ...}.
+    """
+    results = []
+    total = len(questions)
+    for done, original_q in enumerate(questions, 1):
+        variations = generate_variations(original_q, custom_instruction=custom_instruction)
+        results.append({
+            "page": original_q.get("page"),
+            "original": original_q,
+            "variations": variations,
+        })
+        print(f"  ✅ Variations generated for '{original_q.get('id', 'Unknown ID')}'")
+        if progress_callback:
+            progress_callback(
+                done,
+                total,
+                "vary",
+                f"Membuat variasi soal {done} dari {total}...",
+            )
+    return results
+
+
+def export_results(results, output_docx):
+    """Export collected results to DOCX and write the JSON preview sidecar."""
+    export_docx(results, output_docx)
+
+    results_path = output_docx.rsplit(".", 1)[0] + ".json"
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump({"questions": results}, f, ensure_ascii=False, indent=2)
+
+    print(f"  [4/4] DOCX saved to: {output_docx}")
+    return output_docx
+
+
 def run_pipeline(pdf_path, output_docx, custom_instruction=None,
                  batch_size=5, continue_callback=None, progress_callback=None):
     """Run the full pipeline: PDF -> PNG -> Extract (all questions) -> Vary -> DOCX.
@@ -412,14 +456,7 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
                 break
 
     # 4. Export every collected question to a single Word document
-    export_docx(questions, output_docx)
-
-    # Save a JSON sidecar so the Streamlit UI can render a live preview.
-    results_path = output_docx.rsplit(".", 1)[0] + ".json"
-    with open(results_path, "w", encoding="utf-8") as f:
-        json.dump({"questions": questions}, f, ensure_ascii=False, indent=2)
-
-    print(f"  [4/4] DOCX saved to: {output_docx}")
+    export_results(questions, output_docx)
     print(f"✅ Success! {len(questions)}/{total} question(s) exported to: {output_docx}")
 
     return output_docx
