@@ -37,26 +37,27 @@ _ensure_api_key("GEMINI_API_KEY")
 _ensure_api_key("GOOGLE_API_KEY")
 
 # Hybrid model fallback chain: tries models in order until one succeeds.
-# Groq is fast but rate-limited on the free tier, so Gemini (huge free quota)
-# is the middle safety net, then a smaller Groq model as the last resort.
+# Extraction REQUIRES a vision model — currently only qwen3.6-27b on Groq
+# accepts image input (llama-3.3/3.1-8b and gpt-oss are text-only; the old
+# vision previews are decommissioned). Gemini is the safety net: huge free
+# tier, so a Groq rate limit falls through instead of stalling the pipeline.
 EXTRACTION_MODELS = [
     "groq/qwen/qwen3.6-27b",
-    "gemini/gemini-1.5-flash",
-    "groq/llama-3.1-8b-instant",
+    "gemini/gemini-2.0-flash",
 ]
 
 VARIATION_MODELS = [
     "groq/llama-3.3-70b-versatile",
-    "gemini/gemini-1.5-flash",
-    "openai/gpt-4o-mini",
+    "gemini/gemini-2.0-flash",
+    "groq/openai/gpt-oss-120b",
 ]
 
 # Models used to generate the solution discussion (pembahasan) shown in the
 # preview so the user can verify how the AI solves each question.
 SOLUTION_MODELS = [
     "groq/llama-3.3-70b-versatile",
-    "gemini/gemini-1.5-flash",
-    "openai/gpt-4o-mini",
+    "gemini/gemini-2.0-flash",
+    "groq/openai/gpt-oss-120b",
 ]
 
 # Pause between pages to stay under the Groq free-tier TPM rate limit.
