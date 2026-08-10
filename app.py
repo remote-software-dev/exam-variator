@@ -88,7 +88,7 @@ def _save_uploaded_pdf(uploaded_file):
     st.session_state.pdf_ready = True
 
 
-def _run_extraction(custom_instruction):
+def _run_extraction(custom_instruction, max_pages=None):
     """Phase 1: extract all questions from the PDF and generate their pembahasan."""
     from exam_generator.pipeline import extract_all_questions_from_pdf, solve_questions
     with st.status("🔄 Mengekstrak dan Menyelesaikan Soal...", expanded=True) as status:
@@ -113,6 +113,7 @@ def _run_extraction(custom_instruction):
                 custom_instruction=custom_instruction,
                 progress_callback=_on_progress,
                 status_callback=_on_status,
+                max_pages=max_pages,
             )
             if not questions:
                 raise RuntimeError("Tidak ada soal yang berhasil diekstrak. Cek log di atas.")
@@ -178,9 +179,18 @@ custom_instruction = st.text_area(
     placeholder="Contoh: Buat penyelesaian dengan konsep dasar, atau jelaskan cara cepat/trik mengerjakan soal ini...",
 )
 
+max_pages = st.number_input(
+    "Batasi jumlah halaman (opsional, untuk uji coba cepat)",
+    min_value=0,
+    value=0,
+    step=1,
+    help="0 = semua halaman. Isi misalnya 3 untuk menguji hanya 3 halaman pertama.",
+)
+
 if uploaded_file is not None and not st.session_state.get("extraction_done"):
     if st.button("📄 Ekstrak & Selesaikan Soal", type="primary", use_container_width=True):
-        _run_extraction(custom_instruction)
+        page_limit = int(max_pages) if int(max_pages) > 0 else None
+        _run_extraction(custom_instruction, max_pages=page_limit)
 
 if st.session_state.get("extraction_done"):
     questions = st.session_state.questions
