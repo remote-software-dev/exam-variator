@@ -20,25 +20,34 @@ except ImportError:
 
 load_dotenv()
 
-# Fallback: load secrets from Streamlit Cloud if .env is missing
-if "GROQ_API_KEY" not in os.environ:
+# Fallback: load secrets from Streamlit Cloud if .env is missing.
+# LiteLLM reads the provider keys from the environment automatically, so we
+# just make sure GROQ (and Gemini, via GEMINI_API_KEY or GOOGLE_API_KEY) are set.
+def _ensure_api_key(env_name):
+    if env_name in os.environ:
+        return
     try:
         import streamlit as st
-        os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+        os.environ[env_name] = st.secrets[env_name]
     except Exception:
         pass
 
-# LiteLLM model fallback chain: tries models in order until one succeeds.
-# Primary first, then widely-available Groq fallbacks.
+_ensure_api_key("GROQ_API_KEY")
+_ensure_api_key("GEMINI_API_KEY")
+_ensure_api_key("GOOGLE_API_KEY")
+
+# Hybrid model fallback chain: tries models in order until one succeeds.
+# Groq is fast but rate-limited on the free tier, so Gemini (huge free quota)
+# is the middle safety net, then a smaller Groq model as the last resort.
 EXTRACTION_MODELS = [
     "groq/qwen/qwen3.6-27b",
-    "groq/llama-3.3-70b-versatile",
+    "gemini/gemini-1.5-flash",
     "groq/llama-3.1-8b-instant",
-    "groq/gemma2-9b-it",
 ]
 
 VARIATION_MODELS = [
     "groq/llama-3.3-70b-versatile",
+    "gemini/gemini-1.5-flash",
     "openai/gpt-4o-mini",
 ]
 
@@ -46,15 +55,17 @@ VARIATION_MODELS = [
 # preview so the user can verify how the AI solves each question.
 SOLUTION_MODELS = [
     "groq/llama-3.3-70b-versatile",
+    "gemini/gemini-1.5-flash",
     "openai/gpt-4o-mini",
 ]
 
 # Pause between pages to stay under the Groq free-tier TPM rate limit.
 EXTRACTION_DELAY_SECONDS = 10.0
 
-# On a RateLimitError, retry the SAME model (rather than falling back) with
-# exponential backoff: RATE_LIMIT_BACKOFF_SECONDS, then *2, *4 (15s, 30s, 60s).
-RATE_LIMIT_MAX_RETRIES = 4
+# On a RateLimitError, retry the SAME model briefly with exponential backoff
+# (15s -> 30s), then re-raise so the caller falls through to the NEXT model
+# (e.g. Gemini) instead of being stuck on a rate-limited provider.
+RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = 15.0
 
 # Hard cap on retrying the exact same page before logging a clear warning and
@@ -64,11 +75,13 @@ PAGE_BACKOFF_SECONDS = 15.0
 
 
 def _completion_with_retry(model, messages, status_callback=None, **kwargs):
-    """Call litellm.completion, retrying the same model on RateLimitError.
+    """Call litellm.completion, briefly retrying the same model on RateLimitError.
 
-    Waits are exponential (15s -> 30s -> 60s) so the rolling TPM window can
-    clear. Any other exception propagates to the caller so its own fallback
-    logic (trying the next model) still applies.
+    Waits are exponential (15s -> 30s). After RATE_LIMIT_MAX_RETRIES the
+    RateLimitError is re-raised so the caller's fallback chain moves to the
+    NEXT model (e.g. from rate-limited Groq to Gemini) rather than stalling on
+    a single provider. Any non-rate-limit exception propagates immediately so
+    the same fallback logic applies.
 
     status_callback: optional callable(message) notified before each wait so
     the UI can show that the app is still working.
