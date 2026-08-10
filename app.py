@@ -94,15 +94,25 @@ def _run_extraction(custom_instruction):
     with st.status("🔄 Mengekstrak dan Menyelesaikan Soal...", expanded=True) as status:
         progress = st.progress(0.0, text="Memulai...")
         try:
+            last_frac = {"v": 0.0}
+
             def _on_progress(current, total, stage, message=None):
-                progress.progress(min(max(_stage_frac(stage, current, total), 0.0), 1.0),
-                                  text=message or "")
+                last_frac["v"] = min(max(_stage_frac(stage, current, total), 0.0), 1.0)
+                progress.progress(last_frac["v"], text=message or "")
                 status.write(message or "")
+                if stage in ("extract", "solve"):
+                    status.update(label="🔄 Mengekstrak dan Menyelesaikan Soal...")
+
+            def _on_status(message):
+                progress.progress(last_frac["v"], text=message)
+                status.update(label="⏳ Menunggu batas rate limit...")
+                status.write(message)
 
             questions, skipped_pages = extract_all_questions_from_pdf(
                 PDF_PATH,
                 custom_instruction=custom_instruction,
                 progress_callback=_on_progress,
+                status_callback=_on_status,
             )
             if not questions:
                 raise RuntimeError("Tidak ada soal yang berhasil diekstrak. Cek log di atas.")
@@ -110,6 +120,7 @@ def _run_extraction(custom_instruction):
                 questions,
                 custom_instruction=custom_instruction,
                 progress_callback=_on_progress,
+                status_callback=_on_status,
             )
             st.session_state.questions = questions
             st.session_state.skipped_pages = skipped_pages
@@ -129,16 +140,25 @@ def _run_variation(custom_instruction):
         progress = st.progress(0.0, text="Memulai...")
         try:
             selected = st.session_state.selected_questions
+            last_frac = {"v": 0.0}
 
             def _on_progress(current, total, stage, message=None):
-                progress.progress(min(max(_stage_frac(stage, current, total), 0.0), 1.0),
-                                  text=message or "")
+                last_frac["v"] = min(max(_stage_frac(stage, current, total), 0.0), 1.0)
+                progress.progress(last_frac["v"], text=message or "")
                 status.write(message or "")
+                if stage == "vary":
+                    status.update(label="🔄 Membuat Variasi Soal...")
+
+            def _on_status(message):
+                progress.progress(last_frac["v"], text=message)
+                status.update(label="⏳ Menunggu batas rate limit...")
+                status.write(message)
 
             results = generate_variation_results(
                 selected,
                 custom_instruction=custom_instruction,
                 progress_callback=_on_progress,
+                status_callback=_on_status,
             )
             export_results(results, OUTPUT_PATH)
             progress.progress(1.0, text="✅ Selesai!")

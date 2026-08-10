@@ -52,30 +52,43 @@ SOLUTION_MODELS = [
 # Pause between pages to stay under the Groq free-tier TPM rate limit.
 EXTRACTION_DELAY_SECONDS = 10.0
 
-# On a RateLimitError, retry the SAME model (rather than falling back) after
-# this delay, up to this many attempts.
-RATE_LIMIT_MAX_RETRIES = 3
-RATE_LIMIT_RETRY_DELAY_SECONDS = 15.0
+# On a RateLimitError, retry the SAME model (rather than falling back) with
+# exponential backoff: RATE_LIMIT_BACKOFF_SECONDS, then *2, *4 (15s, 30s, 60s).
+RATE_LIMIT_MAX_RETRIES = 4
+RATE_LIMIT_BACKOFF_SECONDS = 15.0
+
+# Hard cap on retrying the exact same page before logging a clear warning and
+# moving on. Page waits use exponential backoff: 15s, 30s, 60s, 120s.
+PAGE_MAX_RETRIES = 5
+PAGE_BACKOFF_SECONDS = 15.0
 
 
-def _completion_with_retry(model, messages, **kwargs):
+def _completion_with_retry(model, messages, status_callback=None, **kwargs):
     """Call litellm.completion, retrying the same model on RateLimitError.
 
-    Any other exception propagates to the caller so its own fallback logic
-    (trying the next model) still applies.
+    Waits are exponential (15s -> 30s -> 60s) so the rolling TPM window can
+    clear. Any other exception propagates to the caller so its own fallback
+    logic (trying the next model) still applies.
+
+    status_callback: optional callable(message) notified before each wait so
+    the UI can show that the app is still working.
     """
+    delay = RATE_LIMIT_BACKOFF_SECONDS
     for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 1):
         try:
             return litellm.completion(model=model, messages=messages, **kwargs)
         except RateLimitError as e:
             if attempt == RATE_LIMIT_MAX_RETRIES:
                 raise
-            print(
-                f"  ⏳ Rate limit hit for {model}; sleeping "
-                f"{RATE_LIMIT_RETRY_DELAY_SECONDS}s, retrying "
-                f"{attempt}/{RATE_LIMIT_MAX_RETRIES}..."
+            message = (
+                f"⏳ Menunggu batas rate limit... (Mencoba lagi dalam {int(delay)} "
+                f"detik, percobaan {attempt}/{RATE_LIMIT_MAX_RETRIES})"
             )
-            time.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
+            print(f"  {message} — {model}")
+            if status_callback:
+                status_callback(message)
+            time.sleep(delay)
+            delay *= 2
 
     raise RuntimeError("unreachable")
 
@@ -84,14 +97,10 @@ def encode_image(image_path):
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 MATRIX_FORMATTING_RULES = (
-    "STRICT MATRIX FORMATTING RULES:\n"
-    "1. NEVER use '|', '||', '∨', or plain text arrays for matrices.\n"
-    "2. You MUST use standard LaTeX matrix environments: "
-    "\\begin{bmatrix} ... \\end{bmatrix} (entries separated by &, "
-    "rows separated by \\\\).\n"
-    "3. FEW-SHOT EXAMPLE: If the matrix is F = [[2, 0], [0, 1/2]], "
-    "you MUST output exactly: "
-    "\\begin{bmatrix} 2 & 0 \\\\ 0 & \\frac{1}{2} \\end{bmatrix}"
+    "MATRICES: always use $\\begin{bmatrix} ... \\end{bmatrix}$ LaTeX "
+    "(entries separated by &, rows by \\\\); NEVER '|', '||', '∨', or plain text "
+    "arrays. Example: [[2,0],[0,1/2]] → $\\begin{bmatrix} 2 & 0 \\\\ "
+    "0 & \\frac{1}{2} \\end{bmatrix}$"
 )
 
 def _extract_json(text):
@@ -110,48 +119,42 @@ def _extraction_system_prompt(custom_instruction, all_questions):
     """Build the shared system prompt for the (single/all) extraction tasks."""
     if all_questions:
         intro = (
-            "You are an expert at extracting Indonesian math exam questions from scanned images.\n"
-            "Return ONLY a valid JSON object with a single key 'questions', which is a list "
-            "of question objects. Each question object has keys: 'id', 'question_text', "
-            "'options' (list of strings).\n\n"
-            "Extract EVERY complete question visible on the image — do not skip, merge, or "
-            "leave out any question.\n\n"
+            "You extract Indonesian math exam questions from scanned images.\n"
+            "Return ONLY a JSON object: {\"questions\": [{\"id\": str, "
+            "\"question_text\": str, \"options\": [str]}]}. Extract EVERY "
+            "complete question visible — do not skip, merge, or omit any.\n\n"
         )
     else:
         intro = (
-            "You are an expert at extracting Indonesian math exam questions from scanned images.\n"
-            "Return ONLY a valid JSON object with keys: 'id', 'question_text', 'options' (list of strings).\n\n"
+            "You extract Indonesian math exam questions from scanned images.\n"
+            "Return ONLY a JSON object: {\"id\": str, \"question_text\": str, "
+            "\"options\": [str]}.\n\n"
         )
 
     rules = (
         "RULES:\n"
-        "- Use LaTeX math notation enclosed in $ delimiters for all formulas "
-        "(e.g., $\\frac{a}{b}$, $x^2$, $\\sqrt{3}$).\n"
+        "- Formulas in $LaTeX$ (e.g. $\\frac{a}{b}$, $x^2$, $\\sqrt{3}$).\n"
         f"- {MATRIX_FORMATTING_RULES}\n"
-        "- 'id' must be the alphanumeric ID printed on the paper (e.g., '25MATBLGBRLM01SU-000000-0246').\n"
-        "  If no ID is visible or the ID is just a number like '1', generate a unique one: "
-        "'EXAM-<RANDOM8HEX>'.\n"
-        "- Handle ALL question formats:\n"
-        "  * Standard multiple choice (A/B/C/D/E) → put options in 'options' list.\n"
-        "  * Benar/Salah (True/False) tables → 'options' should be a list of statements "
-        "each prefixed with the table label, e.g. ['Pernyataan 1: Benar', 'Pernyataan 2: Salah'].\n"
-        "  * Multi-part / stem questions (e.g., 'pernyataan (1), (2), (3)') → put each "
-        "statement as a separate item in 'options'.\n"
+        "- 'id': the alphanumeric ID printed on the paper; if absent or just a "
+        "number, use 'EXAM-<RANDOM8HEX>'.\n"
+        "- 'options': A/B/C/D/E choices, OR per-statement items for Benar/Salah "
+        "tables (prefix 'Pernyataan N: Benar/Salah') and multi-part stems "
+        "(pernyataan (1),(2),(3)).\n"
         "- Preserve the original Indonesian language.\n"
         "- Use double quotes for all JSON keys and string values."
     )
 
     if custom_instruction and custom_instruction.strip():
         rules += (
-            "\n\nADDITIONAL USER INSTRUCTIONS (keep them in mind and apply them "
-            "when relevant, e.g. for solution styles):\n"
+            "\n\nADDITIONAL USER INSTRUCTIONS (apply when relevant, e.g. for "
+            "solution styles):\n"
             f"{custom_instruction.strip()}"
         )
 
     return intro + rules
 
 
-def _extract_via_llm(system_prompt, user_text, models, min_keys=None):
+def _extract_via_llm(system_prompt, user_text, models, min_keys=None, status_callback=None):
     """Run the extraction prompt against the model fallback chain."""
     last_error = None
     for model in models:
@@ -163,6 +166,7 @@ def _extract_via_llm(system_prompt, user_text, models, min_keys=None):
                     {"role": "user", "content": user_text},
                 ],
                 temperature=0.1,
+                status_callback=status_callback,
             )
             raw = response.choices[0].message.content
             result = _extract_json(raw)
@@ -179,7 +183,7 @@ def _extract_via_llm(system_prompt, user_text, models, min_keys=None):
     raise RuntimeError(f"All extraction models failed. Last error: {last_error}")
 
 
-def extract_question_from_image(image_path, custom_instruction=None):
+def extract_question_from_image(image_path, custom_instruction=None, status_callback=None):
     print("  [1/4] Extracting question from image via LiteLLM (with fallbacks)...")
     base64_image = encode_image(image_path)
 
@@ -195,10 +199,11 @@ def extract_question_from_image(image_path, custom_instruction=None):
         user_content,
         EXTRACTION_MODELS,
         min_keys=["id", "question_text"],
+        status_callback=status_callback,
     )
 
 
-def extract_all_questions_from_image(image_path, custom_instruction=None):
+def extract_all_questions_from_image(image_path, custom_instruction=None, status_callback=None):
     """Extract ALL complete questions from an image. Returns a list of question dicts."""
     print("  Extracting ALL questions from image via LiteLLM (with fallbacks)...")
     base64_image = encode_image(image_path)
@@ -215,6 +220,7 @@ def extract_all_questions_from_image(image_path, custom_instruction=None):
         user_content,
         EXTRACTION_MODELS,
         min_keys=["questions"],
+        status_callback=status_callback,
     )
 
     if isinstance(result.get("questions"), list):
@@ -227,7 +233,7 @@ def extract_all_questions_from_image(image_path, custom_instruction=None):
         "Extraction model returned no valid questions for this image."
     )
 
-def generate_variations(original_q, custom_instruction=None):
+def generate_variations(original_q, custom_instruction=None, status_callback=None):
     print("  [2/4] Generating easier and harder variations via LiteLLM (with fallbacks)...")
 
     system_prompt = (
@@ -281,6 +287,7 @@ def generate_variations(original_q, custom_instruction=None):
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.7,
+                status_callback=status_callback,
             )
             raw = response.choices[0].message.content
             result = _extract_json(raw)
@@ -293,7 +300,7 @@ def generate_variations(original_q, custom_instruction=None):
 
     raise RuntimeError(f"All variation models failed. Last error: {last_error}")
 
-def generate_solution(original_q, custom_instruction=None):
+def generate_solution(original_q, custom_instruction=None, status_callback=None):
     """Generate a solution discussion (pembahasan) for a single question.
 
     Returns a dict with 'solution_by_concept' and 'solution_by_trick' keys
@@ -346,6 +353,7 @@ def generate_solution(original_q, custom_instruction=None):
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.3,
+                status_callback=status_callback,
             )
             raw = response.choices[0].message.content
             result = _extract_json(raw)
@@ -360,7 +368,8 @@ def generate_solution(original_q, custom_instruction=None):
 
     raise RuntimeError(f"All solution models failed. Last error: {last_error}")
 
-def solve_questions(questions, custom_instruction=None, progress_callback=None):
+def solve_questions(questions, custom_instruction=None, progress_callback=None,
+                    status_callback=None):
     """Generate a solution discussion (pembahasan) for every question in place.
 
     Each question dict gains 'solution_by_concept' and 'solution_by_trick' keys
@@ -369,12 +378,17 @@ def solve_questions(questions, custom_instruction=None, progress_callback=None):
     Args:
         progress_callback: Optional callable(current, total, stage, message).
             Called after every question; stage is "solve".
+        status_callback: Optional callable(message) for waiting/retry feedback.
 
     Returns the same (mutated) list of questions.
     """
     total = len(questions)
     for done, q in enumerate(questions, 1):
-        solution = generate_solution(q, custom_instruction=custom_instruction)
+        solution = generate_solution(
+            q,
+            custom_instruction=custom_instruction,
+            status_callback=status_callback,
+        )
         q["solution_by_concept"] = solution.get("solution_by_concept", "")
         q["solution_by_trick"] = solution.get("solution_by_trick", "")
         print(f"  ✅ Solution generated for '{q.get('id', 'Unknown ID')}'")
@@ -387,14 +401,22 @@ def solve_questions(questions, custom_instruction=None, progress_callback=None):
             )
     return questions
 
-def extract_all_questions_from_pdf(pdf_path, custom_instruction=None, progress_callback=None):
+def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
+                                   progress_callback=None, status_callback=None):
     """Render each page to PNG and extract ALL questions from every page.
+
+    The page loop is "unbreakable": every page is retried (same page, same
+    image) with exponential backoff until extraction succeeds. A page is only
+    abandoned after PAGE_MAX_RETRIES attempts, and a clear warning is logged
+    (never silently skipped). RateLimitErrors are retried with their own
+    backoff inside _completion_with_retry.
 
     Args:
         pdf_path: Path to the input PDF exam paper.
         custom_instruction: Optional user-provided instructions for the LLM.
         progress_callback: Optional callable(current, total, stage, message).
             Called after each page is extracted; stage is "extract".
+        status_callback: Optional callable(message) for waiting/retry feedback.
 
     Returns (questions, skipped_pages). Each question dict carries its page number
     under the 'page' key so batching can keep results page-aware.
@@ -420,44 +442,80 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None, progress_c
             page_png = os.path.join(pages_dir, f"{page_label}.png")
             pix.save(page_png)
             print(f"  ✅ Rendered page {i + 1} to {page_png}")
-
-            page_questions = extract_all_questions_from_image(
-                page_png, custom_instruction=custom_instruction
-            )
-            for q in page_questions:
-                q.setdefault("page", i + 1)
-            print(f"  ✅ Extracted {len(page_questions)} question(s) from page {i + 1}")
-            questions.extend(page_questions)
-
-            if progress_callback:
-                progress_callback(
-                    i + 1,
-                    page_count,
-                    "extract",
-                    f"Sedang mengekstrak soal dari halaman {i + 1} dari {page_count}...",
-                )
-
-            # Throttle between pages to avoid hitting the Groq free-tier
-            # 8000 TPM rate limit when processing many pages.
-            if i + 1 < page_count:
-                print(f"  ⏳ Waiting {EXTRACTION_DELAY_SECONDS}s to respect the rate limit...")
-                time.sleep(EXTRACTION_DELAY_SECONDS)
         except Exception as e:
             skipped_pages.append(i + 1)
-            print(f"  ❌ Page {i + 1} failed: {e} — skipping to the next page...")
+            print(f"  ⚠️ Page {i + 1} could not be rendered: {e}")
+            continue
+
+        extracted = False
+        for attempt in range(1, PAGE_MAX_RETRIES + 1):
+            try:
+                page_questions = extract_all_questions_from_image(
+                    page_png,
+                    custom_instruction=custom_instruction,
+                    status_callback=status_callback,
+                )
+                for q in page_questions:
+                    q.setdefault("page", i + 1)
+                print(f"  ✅ Extracted {len(page_questions)} question(s) from page {i + 1}")
+                questions.extend(page_questions)
+                extracted = True
+                break
+            except Exception as e:
+                if attempt == PAGE_MAX_RETRIES:
+                    skipped_pages.append(i + 1)
+                    print(f"  ⚠️ Page {i + 1} failed after {PAGE_MAX_RETRIES} attempts: {e}")
+                    if status_callback:
+                        status_callback(
+                            f"⚠️ Halaman {i + 1} gagal setelah {PAGE_MAX_RETRIES} percobaan."
+                        )
+                    break
+                delay = PAGE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                message = (
+                    f"⏳ Halaman {i + 1} gagal (percobaan {attempt}/{PAGE_MAX_RETRIES}); "
+                    f"mencoba lagi dalam {int(delay)} detik..."
+                )
+                print(f"  {message}\n  Error: {e}")
+                if status_callback:
+                    status_callback(message)
+                time.sleep(delay)
+
+        if not extracted:
+            continue
+
+        if progress_callback:
+            progress_callback(
+                i + 1,
+                page_count,
+                "extract",
+                f"Sedang mengekstrak soal dari halaman {i + 1} dari {page_count}...",
+            )
+
+        # Throttle between pages to avoid hitting the Groq free-tier
+        # 8000 TPM rate limit when processing many pages.
+        if i + 1 < page_count:
+            throttle_message = (
+                f"⏳ Menunggu {int(EXTRACTION_DELAY_SECONDS)} detik untuk menghormati "
+                f"batas rate limit..."
+            )
+            print(f"  {throttle_message}")
+            if status_callback:
+                status_callback(throttle_message)
+            time.sleep(EXTRACTION_DELAY_SECONDS)
     doc.close()
 
     return questions, skipped_pages
 
 
 def generate_variation_batch(questions, start, batch_size, custom_instruction=None,
-                             progress_callback=None):
+                             progress_callback=None, status_callback=None):
     """Generate easier/harder variations for questions[start:start + batch_size].
 
     Args:
         progress_callback: Optional callable(current, total, stage, message).
             Called after every question; stage is "vary" and current is the
             global question index across the whole exam.
+        status_callback: Optional callable(message) for waiting/retry feedback.
 
     Returns a list of result items with the same shape the DOCX exporter expects:
     {"page": ..., "original": ..., "variations": ...}.
@@ -465,7 +523,11 @@ def generate_variation_batch(questions, start, batch_size, custom_instruction=No
     results = []
     total = len(questions)
     for offset, original_q in enumerate(questions[start:start + batch_size]):
-        variations = generate_variations(original_q, custom_instruction=custom_instruction)
+        variations = generate_variations(
+            original_q,
+            custom_instruction=custom_instruction,
+            status_callback=status_callback,
+        )
         results.append({
             "page": original_q.get("page"),
             "original": original_q,
@@ -483,7 +545,8 @@ def generate_variation_batch(questions, start, batch_size, custom_instruction=No
     return results
 
 
-def generate_variation_results(questions, custom_instruction=None, progress_callback=None):
+def generate_variation_results(questions, custom_instruction=None, progress_callback=None,
+                               status_callback=None):
     """Generate easier/harder variations for an already-selected list of questions.
 
     Args:
@@ -491,6 +554,7 @@ def generate_variation_results(questions, custom_instruction=None, progress_call
         custom_instruction: Optional user-provided instructions for the LLM.
         progress_callback: Optional callable(current, total, stage, message).
             Called after every question; stage is "vary".
+        status_callback: Optional callable(message) for waiting/retry feedback.
 
     Returns a list of result items with the same shape the DOCX exporter expects:
     {"page": ..., "original": ..., "variations": ...}.
@@ -498,7 +562,11 @@ def generate_variation_results(questions, custom_instruction=None, progress_call
     results = []
     total = len(questions)
     for done, original_q in enumerate(questions, 1):
-        variations = generate_variations(original_q, custom_instruction=custom_instruction)
+        variations = generate_variations(
+            original_q,
+            custom_instruction=custom_instruction,
+            status_callback=status_callback,
+        )
         results.append({
             "page": original_q.get("page"),
             "original": original_q,
@@ -528,7 +596,8 @@ def export_results(results, output_docx):
 
 
 def run_pipeline(pdf_path, output_docx, custom_instruction=None,
-                 batch_size=5, continue_callback=None, progress_callback=None):
+                 batch_size=5, continue_callback=None, progress_callback=None,
+                 status_callback=None):
     """Run the full pipeline: PDF -> PNG -> Extract (all questions) -> Vary -> DOCX.
 
     Args:
@@ -545,10 +614,10 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
             stage is "extract" (current/total = page X of N) or "vary"
             (current/total = question X of N). Used by the UI to drive a live
             progress bar.
+        status_callback: Optional callable(message) for waiting/retry feedback.
 
-    Every page is processed independently inside a try/except so a single
-    failing page (e.g. a blank page or a bad scan) is logged and skipped
-    instead of crashing the whole run.
+    Every page is retried with exponential backoff until it succeeds, or until
+    a hard maximum of retries is hit — in which case a clear warning is logged.
     """
     print("🚀 Starting End-to-End Exam Generator Pipeline...\n")
 
@@ -556,6 +625,7 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
         pdf_path,
         custom_instruction=custom_instruction,
         progress_callback=progress_callback,
+        status_callback=status_callback,
     )
 
     if not all_questions:
@@ -577,6 +647,7 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
             all_questions, start, batch_size,
             custom_instruction=custom_instruction,
             progress_callback=progress_callback,
+            status_callback=status_callback,
         ))
         processed = len(questions)
         print(f"  ✅ Variations generated for {processed}/{total} question(s).")
