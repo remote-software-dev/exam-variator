@@ -9,6 +9,16 @@ import litellm
 from dotenv import load_dotenv
 from litellm.exceptions import RateLimitError
 
+# Optional: pymupdf4llm converts PDFs to clean Markdown locally (free, no AI).
+# It is in requirements.txt, but if it is missing (e.g. an old environment)
+# we degrade gracefully to raw PyMuPDF text extraction instead of crashing.
+try:
+    import pymupdf4llm
+    _PYMUPDF4LLM_AVAILABLE = True
+except ImportError:
+    pymupdf4llm = None
+    _PYMUPDF4LLM_AVAILABLE = False
+
 # Add the project root to the path so we can import modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -54,8 +64,15 @@ EXTRACTION_MODELS = [
 # Text-first extraction models (no vision required). Used for the pages whose
 # text is readable straight out of the PDF — cheap and fast, and it keeps the
 # vision model (and its rate limits) as the exception rather than the default.
-# Groq text models first; Gemini only as a last resort (daily caps are small).
+#
+# LOCAL-FIRST STRATEGY: pages are converted to clean Markdown locally with
+# pymupdf4llm (free, no AI), parsed offline when possible, and only otherwise
+# sent here to a fast, cheap TEXT-ONLY model. llama-3.1-8b-instant heads the
+# chain because it is the cheapest/fastest; if it returns unusable JSON the
+# fallback chain escalates to the larger models below. Groq text models first;
+# Gemini only as a last resort (daily caps are small).
 TEXT_EXTRACTION_MODELS = [
+    "groq/llama-3.1-8b-instant",
     "groq/llama-3.3-70b-versatile",
     "groq/openai/gpt-oss-120b",
     "gemini/gemini-3.6-flash",
@@ -105,6 +122,18 @@ MIN_TEXT_EXTRACTION_CHARS = 50
 _QUESTION_MARKER_RE = re.compile(
     r"(?m)(^\s*\d{1,3}\s*\.|\b[A-E]\s*[\.\)]|\bPernyataan\b|\(\s*\d\s*\))"
 )
+
+# When True, readable pages are parsed locally (offline, zero LLM cost) before
+# any LLM is consulted. Set to False to always use the TEXT LLM extraction.
+LOCAL_PARSING_ENABLED = True
+
+# Local parser regexes (heuristic, no LLM involved).
+# Preferred question delimiter: printed question IDs, e.g. 25ABC...-123456-1234.
+_LOCAL_QID_RE = re.compile(r"(?m)(25[A-Z0-9]{14}-\d{6}-\d{4})")
+# Fallback delimiter: numbered items at the start of a line ("1." / "1)").
+_LOCAL_NUMBERED_RE = re.compile(r"(?m)^\s*(\d{1,3})\s*[\.\)]")
+# Option label at the start of a line.
+_LOCAL_OPTION_RE = re.compile(r"(?m)^\s*([A-E])\s*[\.\)]\s*(.*)")
 
 
 def _is_daily_quota_error(error):
@@ -187,7 +216,7 @@ def _extraction_system_prompt(custom_instruction, all_questions, source="image")
     (extraction from the raw text pulled straight out of the PDF).
     """
     source_phrase = (
-        "the raw text of a PDF page" if source == "text" else "scanned images"
+        "the clean Markdown text of a PDF page" if source == "text" else "scanned images"
     )
     if all_questions:
         intro = (
@@ -349,6 +378,151 @@ def _assess_page_text(text):
     has_markers = bool(_QUESTION_MARKER_RE.search(text))
     has_words = len(re.findall(r"[A-Za-z]{4,}", text)) >= 3
     return (has_markers or has_words), has_markers
+
+
+def _extract_pdf_markdown(pdf_path):
+    """Convert a PDF to clean per-page Markdown locally — free, no AI used.
+
+    Uses pymupdf4llm so math formulas ($LaTeX$) and document structure are
+    preserved far better than a raw text dump. When pymupdf4llm is not
+    installed, falls back to PyMuPDF's raw text extraction (still local and
+    free, just with less structure). Returns a dict mapping the 0-based page
+    index to that page's text. Returns {} when extraction fails so the caller
+    can fall back to rendering each page for the vision model.
+    """
+    if _PYMUPDF4LLM_AVAILABLE:
+        try:
+            chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+            pages = {}
+            for idx, chunk in enumerate(chunks or []):
+                if isinstance(chunk, dict):
+                    pages[idx] = chunk.get("text", "")
+                else:
+                    pages[idx] = str(chunk)
+            return pages
+        except Exception as e:
+            print(f"  ⚠ pymupdf4llm conversion failed: {e}. "
+                  "Falling back to PyMuPDF raw text extraction.")
+
+    import fitz  # PyMuPDF
+
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            return {i: doc[i].get_text() for i in range(doc.page_count)}
+        finally:
+            doc.close()
+    except Exception as e:
+        print(f"  ⚠ PyMuPDF text extraction failed: {e}. "
+              "Falling back to per-page vision extraction.")
+        return {}
+
+
+def parse_questions_from_text(page_text, qid_regex=None):
+    """Heuristically parse MCQ questions from a page's text — no LLM involved.
+
+    Questions are split on printed question IDs (e.g. 25ABC...-123456-1234),
+    or on numbered items ("1.", "2.") when no IDs are present. A block only
+    becomes a question when it has a readable stem AND at least 2 A-E options.
+
+    The parser is deliberately CONSERVATIVE: non-standard layouts (Benar/Salah
+    tables, essay prompts) and jumbled/inline options (two-column layouts) make
+    it return an empty list so the caller falls back to the LLM, rather than
+    exporting a page full of merged or truncated questions.
+
+    Returns a list of question dicts {"id", "question_text", "options"}, or an
+    empty list when the page can't be parsed reliably.
+    """
+    text = (page_text or "").strip()
+    if not text:
+        return []
+
+    qid_re = qid_regex or _LOCAL_QID_RE
+    qid_matches = list(qid_re.finditer(text))
+    if qid_matches:
+        delimiters = qid_matches
+        def get_id(m):
+            return m.group(0)
+    else:
+        numbered = list(_LOCAL_NUMBERED_RE.finditer(text))
+        if not numbered:
+            return []
+        delimiters = numbered
+        def get_id(m):
+            return m.group(1)
+
+    blocks = []
+    for idx, m in enumerate(delimiters):
+        start = m.end()
+        end = delimiters[idx + 1].start() if idx + 1 < len(delimiters) else len(text)
+        blocks.append((get_id(m), text[start:end]))
+
+    questions = []
+    for qid, body in blocks:
+        stem = []
+        options = []
+        current = None
+        for line in body.splitlines():
+            if not line.strip():
+                continue
+            opt_match = _LOCAL_OPTION_RE.match(line)
+            if opt_match:
+                if current is not None:
+                    options.append(current)
+                current = opt_match.group(2).strip()
+            elif current is not None:
+                current += " " + line.strip()
+            else:
+                stem.append(line.strip())
+
+        if current is not None:
+            options.append(current)
+
+        # Reject the whole page when options look jumbled inline (two-column
+        # layouts flattened into one line, e.g. "24 cm B. 28 cm C. 34 cm - D. 36 cm").
+        # Parsing that reliably needs an LLM — return [] so the caller falls back.
+        for opt in options:
+            if re.search(r"(?i)[A-E]\s*[\.\)]\s*\S", opt):
+                return []
+
+        qtext = " ".join(stem).strip()
+        if len(qtext) < MIN_TEXT_EXTRACTION_CHARS // 5:
+            continue
+        if len(options) < 2:
+            continue
+        questions.append({"id": qid, "question_text": qtext, "options": options})
+
+    if not questions:
+        return []
+    # Only trust the parse when we understood most of the page. If the layout
+    # wasn't recognized, most blocks will have failed to parse — falling back
+    # to the (cheap) TEXT LLM beats exporting a page full of merged questions.
+    if len(questions) * 2 < len(delimiters):
+        return []
+
+    return questions
+
+
+def extract_all_questions_from_page_text(page_text, custom_instruction=None,
+                                         status_callback=None):
+    """Extract ALL questions from a page's raw text — local-first, LLM fallback.
+
+    When LOCAL_PARSING_ENABLED, the offline heuristic parser runs first. If it
+    yields questions, no LLM call is made at all. Otherwise the TEXT LLM chain
+    is used. Returns the same list-of-question-dicts shape as the image path.
+    """
+    if LOCAL_PARSING_ENABLED:
+        local = parse_questions_from_text(page_text)
+        if local:
+            print(f"  ✅ Parsed {len(local)} question(s) locally (no LLM call).")
+            return local
+        print("  ⚠ Local parsing found no questions — falling back to TEXT LLM.")
+
+    return extract_all_questions_from_text(
+        page_text,
+        custom_instruction=custom_instruction,
+        status_callback=status_callback,
+    )
 
 def generate_variations(original_q, custom_instruction=None, status_callback=None):
     print("  [2/4] Generating easier and harder variations via LiteLLM (with fallbacks)...")
@@ -559,14 +733,18 @@ def _extract_page_with_retries(extractor, page_num, questions, skipped_pages,
 def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
                                    progress_callback=None, status_callback=None,
                                    max_pages=None):
-    """Extract ALL questions from every page — TEXT-first, vision as fallback.
+    """Extract ALL questions from every page — LOCAL-FIRST, vision as fallback.
 
-    For each page the raw text is pulled straight out of the PDF with PyMuPDF.
-    If the text is usable (long enough and contains question markers or real
-    words), the page is extracted with the cheap TEXT model chain — no image,
-    no vision model. Only pages whose text is empty or clearly
-    garbage/scrambled fall back to being rendered to PNG and sent to the
-    vision model.
+    Strategy (minimizes AI API usage):
+      1. The whole document is converted to clean Markdown locally with
+         pymupdf4llm — free, no AI involved, and it preserves math formulas.
+      2. Each page's Markdown is parsed offline first (zero LLM cost); if that
+         finds nothing it is sent to a cheap TEXT-ONLY model (llama-3.1-8b-
+         instant heads the chain). No image is rendered, no vision model is
+         called.
+      3. Only pages where pymupdf4llm returns empty text — i.e. scanned,
+         image-only pages with no text layer — are rendered to PNG and sent to
+         the expensive VISION model.
 
     The page loop is "unbreakable": every page is retried (same page, same
     input) with exponential backoff until extraction succeeds. A page is only
@@ -588,7 +766,8 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
     """
     import fitz  # PyMuPDF
 
-    print("  📄 Extracting ALL questions (TEXT-first, vision only as fallback)...")
+    print("  📄 Extracting ALL questions (LOCAL-FIRST: Markdown + cheap text "
+          "model, vision only for scanned pages)...")
 
     pages_dir = "data/outputs/pages"
     os.makedirs(pages_dir, exist_ok=True)
@@ -596,20 +775,24 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
     questions = []
     skipped_pages = []
 
+    # Step 1: convert the whole document to clean Markdown locally (free, no AI).
+    # One chunk per page, in document order. Scanned/image-only pages yield "".
+    page_markdown = _extract_pdf_markdown(pdf_path)
+
     doc = fitz.open(pdf_path)
     page_count = doc.page_count
     pages_to_process = page_count if max_pages is None else min(max_pages, page_count)
     print(f"  📄 PDF has {page_count} page(s). Processing {pages_to_process}.")
 
     for i in range(pages_to_process):
-        text = doc[i].get_text()
+        text = page_markdown.get(i, "")
         usable, has_markers = _assess_page_text(text)
 
         if usable:
-            print(f"  Page {i + 1}: Extracted {len(text)} chars. "
-                  f"Contains question markers: {has_markers}. Using TEXT model.")
+            print(f"  Page {i + 1}: Extracted {len(text)} markdown chars. "
+                  f"Contains question markers: {has_markers}. Using cheap TEXT model.")
             extracted = _extract_page_with_retries(
-                lambda: extract_all_questions_from_text(
+                lambda: extract_all_questions_from_page_text(
                     text,
                     custom_instruction=custom_instruction,
                     status_callback=status_callback,
@@ -620,7 +803,8 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
                 status_callback=status_callback,
             )
         else:
-            # Text is empty or garbage/scrambled — this page really needs vision.
+            # pymupdf4llm returned no usable text — this is a scanned
+            # (image-only) page that genuinely needs the vision model.
             page_label = f"page_{i + 1:02d}"
             try:
                 pix = doc[i].get_pixmap(dpi=200)
@@ -632,7 +816,7 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
                 print(f"  ⚠️ Page {i + 1} could not be rendered: {e}")
                 continue
 
-            print(f"  Page {i + 1}: text unusable ({len(text)} chars). "
+            print(f"  Page {i + 1}: no extractable text (scanned image page). "
                   f"Rendering page and using VISION model.")
             extracted = _extract_page_with_retries(
                 lambda: extract_all_questions_from_image(
@@ -772,7 +956,7 @@ def export_results(results, output_docx):
 def run_pipeline(pdf_path, output_docx, custom_instruction=None,
                  batch_size=5, continue_callback=None, progress_callback=None,
                  status_callback=None, max_pages=None):
-    """Run the full pipeline: PDF -> PNG -> Extract (all questions) -> Vary -> DOCX.
+    """Run the full pipeline: PDF -> Markdown -> Extract (all questions) -> Vary -> DOCX.
 
     Args:
         pdf_path: Path to the input PDF exam paper.

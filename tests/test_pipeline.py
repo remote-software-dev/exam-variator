@@ -18,6 +18,20 @@ def _fake_variations(original_q, custom_instruction=None, status_callback=None):
     return {"easier": {"question_text": "e"}, "harder": {"question_text": "h"}}
 
 
+def _make_pdf(tmp_path, page_texts):
+    import fitz
+
+    path = tmp_path / "exam.pdf"
+    doc = fitz.open()
+    for i, text in enumerate(page_texts):
+        page = doc.new_page()
+        if text:
+            page.insert_text((72, 72), text, fontsize=11)
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
 class _Msg:
     def __init__(self, content):
         self.content = content
@@ -246,7 +260,7 @@ class TestExtractAllQuestionsFromText:
         monkeypatch.setattr(pipeline, "_extract_via_llm", fake_via_llm)
         result = pipeline.extract_all_questions_from_text("raw page text")
         assert [q["id"] for q in result] == ["Q1", "Q3"]
-        assert "raw text of a PDF page" in called["source"]
+        assert "clean Markdown text of a PDF page" in called["source"]
         assert called["models"] is pipeline.TEXT_EXTRACTION_MODELS
 
     def test_raises_when_no_valid_questions(self, monkeypatch):
@@ -259,19 +273,143 @@ class TestExtractAllQuestionsFromText:
             pipeline.extract_all_questions_from_text("raw page text")
 
 
+class TestParseQuestionsFromText:
+    def test_numbered_mcq(self):
+        text = ("1. Berapa 2+2?\nA. 3\nB. 4\nC. 5\nD. 6\nE. 7\n"
+                "2. Berapa 3+3?\nA. 5\nB. 6\nC. 7\nD. 8\nE. 9\n")
+        qs = pipeline.parse_questions_from_text(text)
+        assert [q["id"] for q in qs] == ["1", "2"]
+        assert qs[0]["question_text"] == "Berapa 2+2?"
+        assert qs[0]["options"] == ["3", "4", "5", "6", "7"]
+        assert qs[1]["options"] == ["5", "6", "7", "8", "9"]
+
+    def test_qid_delimited(self):
+        qid = "25ABCDEFGHIJKLMN-123456-0001"
+        text = (f"{qid}\nDiketahui $f(x)=2x+3$. Nilai $f(2)$ adalah ...\n"
+                "A. 3\nB. 5\nC. 7\nD. 9\nE. 11\n")
+        qs = pipeline.parse_questions_from_text(text)
+        assert len(qs) == 1
+        assert qs[0]["id"] == qid
+        assert qs[0]["options"] == ["3", "5", "7", "9", "11"]
+        assert "f(x)=2x+3" in qs[0]["question_text"]
+
+    def test_option_continuation_lines(self):
+        text = ("1. Soal dengan opsi panjang?\n"
+                "A. Nilai x adalah 2, dan nilai\n"
+                "   y adalah 3\n"
+                "B. 4\nC. 5\nD. 6\nE. 7\n")
+        qs = pipeline.parse_questions_from_text(text)
+        assert len(qs) == 1
+        assert qs[0]["options"][0] == "Nilai x adalah 2, dan nilai y adalah 3"
+        assert qs[0]["options"][1] == "4"
+
+    def test_fewer_than_two_options_rejected(self):
+        text = "1. Soal ini cuma punya satu opsi?\nA. Saja\n"
+        assert pipeline.parse_questions_from_text(text) == []
+
+    def test_short_stem_rejected(self):
+        text = "1. A.\nB. 2\nC. 3\n"
+        assert pipeline.parse_questions_from_text(text) == []
+
+    def test_no_delimiters_returns_empty(self):
+        assert pipeline.parse_questions_from_text("Hanya teks biasa tanpa nomor.") == []
+
+    def test_jumbled_inline_options_rejected(self):
+        text = ("1. Suatu segitiga panjang sisinya adalah 12 cm dan 8 cm. semua "
+                "besaran berikut dapat menjadi keliling segitiga tersebut, "
+                "kecuali….\n"
+                "A. 24 cm B. 28 cm C. 34 cm - D. 36 cm\n"
+                "E. 38 cm\n")
+        assert pipeline.parse_questions_from_text(text) == []
+
+    def test_partial_parse_of_whole_page_rejected(self):
+        # 10 numbered blocks but only 2 carry A-E options (< half) -> the layout
+        # isn't being understood, so reject the whole page and let the LLM try.
+        lines = []
+        for n in range(1, 11):
+            lines.append(f"{n}. Soal nomor {n} yang di sini adalah sebuah pernyataan?\n")
+            if n in (1, 6):
+                lines.append("A. 1\nB. 2\nC. 3\nD. 4\nE. 5\n")
+        text = "\n".join(lines)
+        assert pipeline.parse_questions_from_text(text) == []
+
+    def test_empty_text_returns_empty(self):
+        assert pipeline.parse_questions_from_text("") == []
+        assert pipeline.parse_questions_from_text(None) == []
+
+
+class TestExtractAllQuestionsFromPageText:
+    def test_local_parser_used_without_llm(self, monkeypatch):
+        text = "1. Berapa 2+2?\nA. 3\nB. 4\nC. 5\nD. 6\nE. 7\n"
+
+        def fail_llm(*a, **k):
+            raise AssertionError("LLM must not be called when local parse succeeds")
+
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_text", fail_llm)
+        qs = pipeline.extract_all_questions_from_page_text(text)
+        assert len(qs) == 1
+        assert qs[0]["question_text"] == "Berapa 2+2?"
+
+    def test_falls_back_to_llm_when_parse_fails(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "parse_questions_from_text",
+                            lambda t, qid_regex=None: [])
+        called = {"n": 0}
+
+        def fake_llm(page_text, custom_instruction=None, status_callback=None):
+            called["n"] += 1
+            return [{"id": "Q1", "question_text": page_text.strip()}]
+
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_text", fake_llm)
+        qs = pipeline.extract_all_questions_from_page_text("1. Text\nA. 1\nB. 2\nC. 3")
+        assert called["n"] == 1
+        assert qs[0]["id"] == "Q1"
+
+    def test_llm_used_when_local_disabled(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "LOCAL_PARSING_ENABLED", False)
+        monkeypatch.setattr(pipeline, "parse_questions_from_text",
+                            lambda t, qid_regex=None: [{"id": "X"}])
+        called = {"n": 0}
+
+        def fake_llm(page_text, custom_instruction=None, status_callback=None):
+            called["n"] += 1
+            return [{"id": "Q1", "question_text": page_text.strip()}]
+
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_text", fake_llm)
+        pipeline.extract_all_questions_from_page_text("1. Text\nA. 1\nB. 2\nC. 3")
+        assert called["n"] == 1
+
+
+class TestTextExtractionModels:
+    def test_cheap_model_heads_the_text_chain(self):
+        assert pipeline.TEXT_EXTRACTION_MODELS[0] == "groq/llama-3.1-8b-instant"
+
+
+class TestExtractPdfMarkdown:
+    def test_converts_text_pdf_to_per_page_markdown(self, tmp_path):
+        pdf = _make_pdf(tmp_path, ["Soal 1\nA. 1\nB. 2\nC. 3\nD. 4\nE. 5\n",
+                                   "Soal 2\nA. 6\nB. 7\nC. 8\nD. 9\nE. 10\n"])
+        pages = pipeline._extract_pdf_markdown(pdf)
+        assert isinstance(pages, dict)
+        assert set(pages) == {0, 1}
+        assert "Soal 1" in pages[0]
+        assert "Soal 2" in pages[1]
+
+    def test_blank_page_yields_empty_text(self, tmp_path):
+        pdf = _make_pdf(tmp_path, ["Some real text here on this page.\n" * 5, ""])
+        pages = pipeline._extract_pdf_markdown(pdf)
+        assert pages[1].strip() == ""
+
+    def test_conversion_failure_returns_empty_dict(self, monkeypatch, tmp_path):
+        def fail(*a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(pipeline.pymupdf4llm, "to_markdown", fail)
+        assert pipeline._extract_pdf_markdown(str(tmp_path / "x.pdf")) == {}
+
+
 class TestExtractAllQuestionsFromPdf:
     def _make_pdf(self, tmp_path, page_texts):
-        import fitz
-
-        path = tmp_path / "exam.pdf"
-        doc = fitz.open()
-        for i, text in enumerate(page_texts):
-            page = doc.new_page()
-            if text:
-                page.insert_text((72, 72), text, fontsize=11)
-        doc.save(str(path))
-        doc.close()
-        return str(path)
+        return _make_pdf(tmp_path, page_texts)
 
     def test_text_first_path_skips_vision(self, monkeypatch, tmp_path):
         pdf = self._make_pdf(
@@ -289,7 +427,7 @@ class TestExtractAllQuestionsFromPdf:
             calls["vision"] += 1
             raise AssertionError("vision must not be used on a text page")
 
-        monkeypatch.setattr(pipeline, "extract_all_questions_from_text", fake_text)
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_page_text", fake_text)
         monkeypatch.setattr(pipeline, "extract_all_questions_from_image", fail_vision)
 
         questions, skipped = pipeline.extract_all_questions_from_pdf(pdf)
@@ -311,7 +449,7 @@ class TestExtractAllQuestionsFromPdf:
             calls["vision"] += 1
             return [{"id": "Q1", "question_text": "from image"}]
 
-        monkeypatch.setattr(pipeline, "extract_all_questions_from_text", fail_text)
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_page_text", fail_text)
         monkeypatch.setattr(pipeline, "extract_all_questions_from_image", fake_vision)
 
         questions, skipped = pipeline.extract_all_questions_from_pdf(pdf)
@@ -335,7 +473,7 @@ class TestExtractAllQuestionsFromPdf:
         def fail_vision(*a, **k):
             raise AssertionError("vision must not be used on a text page")
 
-        monkeypatch.setattr(pipeline, "extract_all_questions_from_text", fake_text)
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_page_text", fake_text)
         monkeypatch.setattr(pipeline, "extract_all_questions_from_image", fail_vision)
 
         questions, skipped = pipeline.extract_all_questions_from_pdf(pdf, max_pages=2)
@@ -354,7 +492,7 @@ class TestExtractAllQuestionsFromPdf:
             calls["n"] += 1
             return [{"id": f"Q{calls['n']}", "question_text": page_text.strip()}]
 
-        monkeypatch.setattr(pipeline, "extract_all_questions_from_text", fake_text)
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_page_text", fake_text)
         monkeypatch.setattr(
             pipeline, "extract_all_questions_from_image",
             lambda *a, **k: (_ for _ in ()).throw(AssertionError("vision used")),
