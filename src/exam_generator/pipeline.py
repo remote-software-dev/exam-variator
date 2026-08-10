@@ -4,6 +4,7 @@ import json
 import base64
 import re
 import time
+import argparse
 import litellm
 from dotenv import load_dotenv
 from litellm.exceptions import RateLimitError
@@ -37,27 +38,47 @@ _ensure_api_key("GEMINI_API_KEY")
 _ensure_api_key("GOOGLE_API_KEY")
 
 # Hybrid model fallback chain: tries models in order until one succeeds.
-# Extraction REQUIRES a vision model — currently only qwen3.6-27b on Groq
-# accepts image input (llama-3.3/3.1-8b and gpt-oss are text-only; the old
-# vision previews are decommissioned). Gemini is the safety net: huge free
-# tier, so a Groq rate limit falls through instead of stalling the pipeline.
+# Pages are processed TEXT-first (see extract_all_questions_from_pdf), so the
+# vision model below is only used when a page's text is missing or garbled.
+# Gemini is the safety net: its large free tier means a Groq rate limit falls
+# through instead of stalling the pipeline. The Gemini free tier caps usage at
+# 20 requests/day PER MODEL, so the chain spans several Gemini models — each
+# has its own separate daily budget.
 EXTRACTION_MODELS = [
     "groq/qwen/qwen3.6-27b",
-    "gemini/gemini-2.0-flash",
+    "gemini/gemini-3.6-flash",
+    "gemini/gemini-3-flash-preview",
+    "gemini/gemini-3.1-flash-lite",
+]
+
+# Text-first extraction models (no vision required). Used for the pages whose
+# text is readable straight out of the PDF — cheap and fast, and it keeps the
+# vision model (and its rate limits) as the exception rather than the default.
+# Groq text models first; Gemini only as a last resort (daily caps are small).
+TEXT_EXTRACTION_MODELS = [
+    "groq/llama-3.3-70b-versatile",
+    "groq/openai/gpt-oss-120b",
+    "gemini/gemini-3.6-flash",
+    "gemini/gemini-3-flash-preview",
+    "gemini/gemini-3.1-flash-lite",
 ]
 
 VARIATION_MODELS = [
     "groq/llama-3.3-70b-versatile",
-    "gemini/gemini-2.0-flash",
     "groq/openai/gpt-oss-120b",
+    "gemini/gemini-3.6-flash",
+    "gemini/gemini-3-flash-preview",
+    "gemini/gemini-3.1-flash-lite",
 ]
 
 # Models used to generate the solution discussion (pembahasan) shown in the
 # preview so the user can verify how the AI solves each question.
 SOLUTION_MODELS = [
     "groq/llama-3.3-70b-versatile",
-    "gemini/gemini-2.0-flash",
     "groq/openai/gpt-oss-120b",
+    "gemini/gemini-3.6-flash",
+    "gemini/gemini-3-flash-preview",
+    "gemini/gemini-3.1-flash-lite",
 ]
 
 # Pause between pages to stay under the Groq free-tier TPM rate limit.
@@ -74,6 +95,29 @@ RATE_LIMIT_BACKOFF_SECONDS = 15.0
 PAGE_MAX_RETRIES = 5
 PAGE_BACKOFF_SECONDS = 15.0
 
+# A page's text must be at least this long before we trust it as real content;
+# anything shorter is treated as empty/blank and sent to the vision model.
+MIN_TEXT_EXTRACTION_CHARS = 50
+
+# Signals that a page is real question content: numbered items ("1."), option
+# labels ("A." / "A)"), statement items for Benar/Salah tables ("(1)"), or the
+# literal word "Pernyataan".
+_QUESTION_MARKER_RE = re.compile(
+    r"(?m)(^\s*\d{1,3}\s*\.|\b[A-E]\s*[\.\)]|\bPernyataan\b|\(\s*\d\s*\))"
+)
+
+
+def _is_daily_quota_error(error):
+    """True when a RateLimitError comes from a DAILY (per-project per-model) cap.
+
+    Google's per-day free-tier caps (e.g. 20 requests/day/model) never reset
+    within a run, so retrying with backoff is pointless — fail fast so the
+    fallback chain moves to the next model immediately. Per-minute rate limits
+    (TPM/RPM) are NOT flagged here: they reset and are worth retrying.
+    """
+    msg = str(getattr(error, "message", "") or error)
+    return "PerDay" in msg or "per_day" in msg or "dailyLimitExceeded" in msg
+
 
 def _completion_with_retry(model, messages, status_callback=None, **kwargs):
     """Call litellm.completion, briefly retrying the same model on RateLimitError.
@@ -84,6 +128,10 @@ def _completion_with_retry(model, messages, status_callback=None, **kwargs):
     a single provider. Any non-rate-limit exception propagates immediately so
     the same fallback logic applies.
 
+    A RateLimitError caused by an exhausted DAILY quota is re-raised at once
+    (no backoff wait) — sleeping would just burn time on a cap that won't
+    reset until the next day.
+
     status_callback: optional callable(message) notified before each wait so
     the UI can show that the app is still working.
     """
@@ -92,6 +140,9 @@ def _completion_with_retry(model, messages, status_callback=None, **kwargs):
         try:
             return litellm.completion(model=model, messages=messages, **kwargs)
         except RateLimitError as e:
+            if _is_daily_quota_error(e):
+                print(f"  ⚠ {model} daily quota exhausted — skipping backoff, trying next model.")
+                raise
             if attempt == RATE_LIMIT_MAX_RETRIES:
                 raise
             message = (
@@ -129,18 +180,25 @@ def _extract_json(text):
             return None
     return None
 
-def _extraction_system_prompt(custom_instruction, all_questions):
-    """Build the shared system prompt for the (single/all) extraction tasks."""
+def _extraction_system_prompt(custom_instruction, all_questions, source="image"):
+    """Build the shared system prompt for the (single/all) extraction tasks.
+
+    source is "image" (vision extraction from a rendered page) or "text"
+    (extraction from the raw text pulled straight out of the PDF).
+    """
+    source_phrase = (
+        "the raw text of a PDF page" if source == "text" else "scanned images"
+    )
     if all_questions:
         intro = (
-            "You extract Indonesian math exam questions from scanned images.\n"
+            f"You extract Indonesian math exam questions from {source_phrase}.\n"
             "Return ONLY a JSON object: {\"questions\": [{\"id\": str, "
             "\"question_text\": str, \"options\": [str]}]}. Extract EVERY "
             "complete question visible — do not skip, merge, or omit any.\n\n"
         )
     else:
         intro = (
-            "You extract Indonesian math exam questions from scanned images.\n"
+            f"You extract Indonesian math exam questions from {source_phrase}.\n"
             "Return ONLY a JSON object: {\"id\": str, \"question_text\": str, "
             "\"options\": [str]}.\n\n"
         )
@@ -246,6 +304,51 @@ def extract_all_questions_from_image(image_path, custom_instruction=None, status
     raise RuntimeError(
         "Extraction model returned no valid questions for this image."
     )
+
+def extract_all_questions_from_text(page_text, custom_instruction=None, status_callback=None):
+    """Extract ALL complete questions from a page's raw text (no vision).
+
+    The text is sent to the cheap TEXT model chain, so the vision model is
+    never involved. Returns the same list-of-question-dicts shape as
+    extract_all_questions_from_image.
+    """
+    print("  Extracting ALL questions from page TEXT via LiteLLM (with fallbacks)...")
+    system_prompt = _extraction_system_prompt(custom_instruction, all_questions=True,
+                                              source="text")
+
+    result = _extract_via_llm(
+        system_prompt,
+        page_text,
+        TEXT_EXTRACTION_MODELS,
+        min_keys=["questions"],
+        status_callback=status_callback,
+    )
+
+    if isinstance(result.get("questions"), list):
+        questions = [q for q in result["questions"]
+                     if isinstance(q, dict) and q.get("question_text")]
+        if questions:
+            return questions
+
+    raise RuntimeError(
+        "Text extraction model returned no valid questions for this page."
+    )
+
+def _assess_page_text(text):
+    """Return (usable, has_markers) for a page's extracted PDF text.
+
+    usable=True means the text is long enough (>= MIN_TEXT_EXTRACTION_CHARS)
+    and looks like real question content (question markers and/or recognizable
+    words), so extraction can skip the vision model. usable=False means the
+    page is empty, or the text is garbage/scrambled, and the caller must fall
+    back to rendering the page and using the vision model.
+    """
+    text = (text or "").strip()
+    if len(text) < MIN_TEXT_EXTRACTION_CHARS:
+        return False, False
+    has_markers = bool(_QUESTION_MARKER_RE.search(text))
+    has_words = len(re.findall(r"[A-Za-z]{4,}", text)) >= 3
+    return (has_markers or has_words), has_markers
 
 def generate_variations(original_q, custom_instruction=None, status_callback=None):
     print("  [2/4] Generating easier and harder variations via LiteLLM (with fallbacks)...")
@@ -415,12 +518,58 @@ def solve_questions(questions, custom_instruction=None, progress_callback=None,
             )
     return questions
 
+def _extract_page_with_retries(extractor, page_num, questions, skipped_pages,
+                               status_callback=None):
+    """Run a page's extractor function with exponential-backoff retries.
+
+    `extractor` must be a zero-arg callable returning a list of question dicts.
+    Returns True when the page was extracted successfully (its questions were
+    appended to `questions`), or False when it was abandoned after
+    PAGE_MAX_RETRIES attempts.
+    """
+    for attempt in range(1, PAGE_MAX_RETRIES + 1):
+        try:
+            page_questions = extractor()
+            for q in page_questions:
+                q.setdefault("page", page_num)
+            print(f"  ✅ Extracted {len(page_questions)} question(s) from page {page_num}")
+            questions.extend(page_questions)
+            return True
+        except Exception as e:
+            if attempt == PAGE_MAX_RETRIES:
+                skipped_pages.append(page_num)
+                print(f"  ⚠️ Page {page_num} failed after {PAGE_MAX_RETRIES} attempts: {e}")
+                if status_callback:
+                    status_callback(
+                        f"⚠️ Halaman {page_num} gagal setelah {PAGE_MAX_RETRIES} percobaan."
+                    )
+                return False
+            delay = PAGE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            message = (
+                f"⏳ Halaman {page_num} gagal (percobaan {attempt}/{PAGE_MAX_RETRIES}); "
+                f"mencoba lagi dalam {int(delay)} detik..."
+            )
+            print(f"  {message}\n  Error: {e}")
+            if status_callback:
+                status_callback(message)
+            time.sleep(delay)
+    return False
+
+
 def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
-                                   progress_callback=None, status_callback=None):
-    """Render each page to PNG and extract ALL questions from every page.
+                                   progress_callback=None, status_callback=None,
+                                   max_pages=None):
+    """Extract ALL questions from every page — TEXT-first, vision as fallback.
+
+    For each page the raw text is pulled straight out of the PDF with PyMuPDF.
+    If the text is usable (long enough and contains question markers or real
+    words), the page is extracted with the cheap TEXT model chain — no image,
+    no vision model. Only pages whose text is empty or clearly
+    garbage/scrambled fall back to being rendered to PNG and sent to the
+    vision model.
 
     The page loop is "unbreakable": every page is retried (same page, same
-    image) with exponential backoff until extraction succeeds. A page is only
+    input) with exponential backoff until extraction succeeds. A page is only
     abandoned after PAGE_MAX_RETRIES attempts, and a clear warning is logged
     (never silently skipped). RateLimitErrors are retried with their own
     backoff inside _completion_with_retry.
@@ -431,13 +580,15 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
         progress_callback: Optional callable(current, total, stage, message).
             Called after each page is extracted; stage is "extract".
         status_callback: Optional callable(message) for waiting/retry feedback.
+        max_pages: Optional int. When set, only the first `max_pages` pages are
+            processed (useful for quick tests on a large scanned exam).
 
     Returns (questions, skipped_pages). Each question dict carries its page number
     under the 'page' key so batching can keep results page-aware.
     """
     import fitz  # PyMuPDF
 
-    print("  📄 Rendering pages and extracting ALL questions...")
+    print("  📄 Extracting ALL questions (TEXT-first, vision only as fallback)...")
 
     pages_dir = "data/outputs/pages"
     os.makedirs(pages_dir, exist_ok=True)
@@ -447,52 +598,53 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
 
     doc = fitz.open(pdf_path)
     page_count = doc.page_count
-    print(f"  📄 PDF has {page_count} page(s).")
+    pages_to_process = page_count if max_pages is None else min(max_pages, page_count)
+    print(f"  📄 PDF has {page_count} page(s). Processing {pages_to_process}.")
 
-    for i in range(page_count):
-        page_label = f"page_{i + 1:02d}"
-        try:
-            pix = doc[i].get_pixmap(dpi=200)
-            page_png = os.path.join(pages_dir, f"{page_label}.png")
-            pix.save(page_png)
-            print(f"  ✅ Rendered page {i + 1} to {page_png}")
-        except Exception as e:
-            skipped_pages.append(i + 1)
-            print(f"  ⚠️ Page {i + 1} could not be rendered: {e}")
-            continue
+    for i in range(pages_to_process):
+        text = doc[i].get_text()
+        usable, has_markers = _assess_page_text(text)
 
-        extracted = False
-        for attempt in range(1, PAGE_MAX_RETRIES + 1):
+        if usable:
+            print(f"  Page {i + 1}: Extracted {len(text)} chars. "
+                  f"Contains question markers: {has_markers}. Using TEXT model.")
+            extracted = _extract_page_with_retries(
+                lambda: extract_all_questions_from_text(
+                    text,
+                    custom_instruction=custom_instruction,
+                    status_callback=status_callback,
+                ),
+                page_num=i + 1,
+                questions=questions,
+                skipped_pages=skipped_pages,
+                status_callback=status_callback,
+            )
+        else:
+            # Text is empty or garbage/scrambled — this page really needs vision.
+            page_label = f"page_{i + 1:02d}"
             try:
-                page_questions = extract_all_questions_from_image(
+                pix = doc[i].get_pixmap(dpi=200)
+                page_png = os.path.join(pages_dir, f"{page_label}.png")
+                pix.save(page_png)
+                print(f"  ✅ Rendered page {i + 1} to {page_png}")
+            except Exception as e:
+                skipped_pages.append(i + 1)
+                print(f"  ⚠️ Page {i + 1} could not be rendered: {e}")
+                continue
+
+            print(f"  Page {i + 1}: text unusable ({len(text)} chars). "
+                  f"Rendering page and using VISION model.")
+            extracted = _extract_page_with_retries(
+                lambda: extract_all_questions_from_image(
                     page_png,
                     custom_instruction=custom_instruction,
                     status_callback=status_callback,
-                )
-                for q in page_questions:
-                    q.setdefault("page", i + 1)
-                print(f"  ✅ Extracted {len(page_questions)} question(s) from page {i + 1}")
-                questions.extend(page_questions)
-                extracted = True
-                break
-            except Exception as e:
-                if attempt == PAGE_MAX_RETRIES:
-                    skipped_pages.append(i + 1)
-                    print(f"  ⚠️ Page {i + 1} failed after {PAGE_MAX_RETRIES} attempts: {e}")
-                    if status_callback:
-                        status_callback(
-                            f"⚠️ Halaman {i + 1} gagal setelah {PAGE_MAX_RETRIES} percobaan."
-                        )
-                    break
-                delay = PAGE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                message = (
-                    f"⏳ Halaman {i + 1} gagal (percobaan {attempt}/{PAGE_MAX_RETRIES}); "
-                    f"mencoba lagi dalam {int(delay)} detik..."
-                )
-                print(f"  {message}\n  Error: {e}")
-                if status_callback:
-                    status_callback(message)
-                time.sleep(delay)
+                ),
+                page_num=i + 1,
+                questions=questions,
+                skipped_pages=skipped_pages,
+                status_callback=status_callback,
+            )
 
         if not extracted:
             continue
@@ -500,14 +652,14 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
         if progress_callback:
             progress_callback(
                 i + 1,
-                page_count,
+                pages_to_process,
                 "extract",
-                f"Sedang mengekstrak soal dari halaman {i + 1} dari {page_count}...",
+                f"Sedang mengekstrak soal dari halaman {i + 1} dari {pages_to_process}...",
             )
 
         # Throttle between pages to avoid hitting the Groq free-tier
         # 8000 TPM rate limit when processing many pages.
-        if i + 1 < page_count:
+        if i + 1 < pages_to_process:
             throttle_message = (
                 f"⏳ Menunggu {int(EXTRACTION_DELAY_SECONDS)} detik untuk menghormati "
                 f"batas rate limit..."
@@ -521,11 +673,20 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
     return questions, skipped_pages
 
 
-def generate_variation_batch(questions, start, batch_size, custom_instruction=None,
-                             progress_callback=None, status_callback=None):
-    """Generate easier/harder variations for questions[start:start + batch_size].
+def _generate_variation_results(questions, start=0, batch_size=None,
+                                custom_instruction=None, progress_callback=None,
+                                status_callback=None):
+    """Shared engine that generates easier/harder variations for a question slice.
+
+    This is the single implementation behind generate_variation_batch and
+    generate_variation_results. When batch_size is None, every question from
+    `start` to the end of the list is processed.
 
     Args:
+        questions: The full list of questions to process.
+        start: Index of the first question in this slice.
+        batch_size: How many questions to process; None means "the rest".
+        custom_instruction: Optional user-provided instructions for the LLM.
         progress_callback: Optional callable(current, total, stage, message).
             Called after every question; stage is "vary" and current is the
             global question index across the whole exam.
@@ -534,6 +695,9 @@ def generate_variation_batch(questions, start, batch_size, custom_instruction=No
     Returns a list of result items with the same shape the DOCX exporter expects:
     {"page": ..., "original": ..., "variations": ...}.
     """
+    if batch_size is None:
+        batch_size = len(questions) - start
+
     results = []
     total = len(questions)
     for offset, original_q in enumerate(questions[start:start + batch_size]):
@@ -559,42 +723,38 @@ def generate_variation_batch(questions, start, batch_size, custom_instruction=No
     return results
 
 
+def generate_variation_batch(questions, start, batch_size, custom_instruction=None,
+                             progress_callback=None, status_callback=None):
+    """Generate easier/harder variations for questions[start:start + batch_size].
+
+    Progress uses the global question index (start + offset + 1) so batching
+    over the whole exam keeps the count continuous across batches.
+    """
+    return _generate_variation_results(
+        questions,
+        start=start,
+        batch_size=batch_size,
+        custom_instruction=custom_instruction,
+        progress_callback=progress_callback,
+        status_callback=status_callback,
+    )
+
+
 def generate_variation_results(questions, custom_instruction=None, progress_callback=None,
                                status_callback=None):
     """Generate easier/harder variations for an already-selected list of questions.
 
-    Args:
-        questions: The questions (already selected by the user) to process.
-        custom_instruction: Optional user-provided instructions for the LLM.
-        progress_callback: Optional callable(current, total, stage, message).
-            Called after every question; stage is "vary".
-        status_callback: Optional callable(message) for waiting/retry feedback.
-
-    Returns a list of result items with the same shape the DOCX exporter expects:
-    {"page": ..., "original": ..., "variations": ...}.
+    Thin wrapper around _generate_variation_results that processes the whole
+    list in one pass.
     """
-    results = []
-    total = len(questions)
-    for done, original_q in enumerate(questions, 1):
-        variations = generate_variations(
-            original_q,
-            custom_instruction=custom_instruction,
-            status_callback=status_callback,
-        )
-        results.append({
-            "page": original_q.get("page"),
-            "original": original_q,
-            "variations": variations,
-        })
-        print(f"  ✅ Variations generated for '{original_q.get('id', 'Unknown ID')}'")
-        if progress_callback:
-            progress_callback(
-                done,
-                total,
-                "vary",
-                f"Membuat variasi soal {done} dari {total}...",
-            )
-    return results
+    return _generate_variation_results(
+        questions,
+        start=0,
+        batch_size=None,
+        custom_instruction=custom_instruction,
+        progress_callback=progress_callback,
+        status_callback=status_callback,
+    )
 
 
 def export_results(results, output_docx):
@@ -611,7 +771,7 @@ def export_results(results, output_docx):
 
 def run_pipeline(pdf_path, output_docx, custom_instruction=None,
                  batch_size=5, continue_callback=None, progress_callback=None,
-                 status_callback=None):
+                 status_callback=None, max_pages=None):
     """Run the full pipeline: PDF -> PNG -> Extract (all questions) -> Vary -> DOCX.
 
     Args:
@@ -629,6 +789,8 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
             (current/total = question X of N). Used by the UI to drive a live
             progress bar.
         status_callback: Optional callable(message) for waiting/retry feedback.
+        max_pages: Optional int. When set, only the first `max_pages` pages are
+            extracted (useful for quick tests on a large scanned exam).
 
     Every page is retried with exponential backoff until it succeeds, or until
     a hard maximum of retries is hit — in which case a clear warning is logged.
@@ -640,6 +802,7 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
         custom_instruction=custom_instruction,
         progress_callback=progress_callback,
         status_callback=status_callback,
+        max_pages=max_pages,
     )
 
     if not all_questions:
@@ -678,9 +841,21 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Extract questions from a PDF, generate variations, export DOCX."
+    )
+    parser.add_argument("--pdf", default="data/inputs/SOAL TKA Matematika SMA 2025 Umum.pdf",
+                        help="Path to the input exam PDF.")
+    parser.add_argument("--output", default="data/outputs/final_pipeline_test.docx",
+                        help="Where to save the generated DOCX.")
+    parser.add_argument("--max-pages", type=int, default=None,
+                        help="Only process the first N pages (e.g. 3 for a quick test).")
+    args = parser.parse_args()
+
     run_pipeline(
-        pdf_path="data/inputs/SOAL TKA Matematika SMA 2025 Umum.pdf",
-        output_docx="data/outputs/final_pipeline_test.docx",
+        pdf_path=args.pdf,
+        output_docx=args.output,
+        max_pages=args.max_pages,
     )
 
 if __name__ == "__main__":
