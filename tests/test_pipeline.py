@@ -503,6 +503,51 @@ class TestExtractAllQuestionsFromPdf:
         assert [q["page"] for q in questions] == [1, 2]
 
 
+class TestGetPdfPageCount:
+    def test_returns_page_count(self, tmp_path):
+        pdf = _make_pdf(tmp_path, ["a\n" * 20] * 3)
+        assert pipeline.get_pdf_page_count(pdf) == 3
+
+
+class TestExtractPageQuestions:
+    def test_extracts_only_requested_page_text_path(self, monkeypatch, tmp_path):
+        pdf = _make_pdf(tmp_path, ["1. Soal 1?\nA. 1\nB. 2\nC. 3\nD. 4\nE. 5\n",
+                                   "2. Soal 2?\nA. 1\nB. 2\nC. 3\nD. 4\nE. 5\n"])
+        calls = {"text": 0, "image": 0}
+
+        def fake_page_text(page_text, custom_instruction=None, status_callback=None):
+            calls["text"] += 1
+            return [{"id": "Q2", "question_text": "dari halaman 2"}]
+
+        def fail_image(*a, **k):
+            calls["image"] += 1
+            raise AssertionError("vision must not be used on a text page")
+
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_page_text", fake_page_text)
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_image", fail_image)
+
+        qs = pipeline.extract_page_questions(pdf, page_index=2)
+        assert calls["text"] == 1
+        assert calls["image"] == 0
+        assert qs[0]["page"] == 2
+
+    def test_empty_page_uses_vision(self, monkeypatch, tmp_path):
+        pdf = _make_pdf(tmp_path, ["", "1. Soal 1?\nA. 1\nB. 2\nC. 3\nD. 4\nE. 5\n"])
+
+        def fail_text(*a, **k):
+            raise AssertionError("text must not be used on a blank page")
+
+        def fake_image(image_path, custom_instruction=None, status_callback=None):
+            assert image_path.endswith("page_01.png")
+            return [{"id": "Q1", "question_text": "dari gambar"}]
+
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_page_text", fail_text)
+        monkeypatch.setattr(pipeline, "extract_all_questions_from_image", fake_image)
+
+        qs = pipeline.extract_page_questions(pdf, page_index=1)
+        assert qs[0]["page"] == 1
+
+
 class TestBatching:
     def test_generate_variation_batch_slices(self, monkeypatch):
         monkeypatch.setattr(pipeline, "generate_variations", _fake_variations)
