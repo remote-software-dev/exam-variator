@@ -6,6 +6,8 @@ import streamlit as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
+from exam_generator.latex_utils import normalize_latex
+
 st.set_page_config(page_title="Generator Variasi Soal", layout="centered")
 st.title("🎓 Generator Variasi Soal")
 st.markdown("Unggah PDF soal ujian untuk mengekstrak semua soal secara otomatis, meninjau pembahasan AI untuk setiap soal, lalu pilih soal yang ingin divariasikan dan unduh hasilnya dalam bentuk Word.")
@@ -24,6 +26,11 @@ STAGE_FRACTIONS = {
 def _stage_frac(stage, current, total):
     lo, hi = STAGE_FRACTIONS.get(stage, (0.0, 1.0))
     return lo + (hi - lo) * (current / max(total, 1))
+
+
+def _render_solution(body, title_md="**Penyelesaian**"):
+    """Render AI solution text, normalizing LaTeX so formulas render properly."""
+    st.markdown(f"{title_md}\n\n{normalize_latex(body)}", unsafe_allow_html=True)
 
 
 def _render_preview():
@@ -52,14 +59,14 @@ def _render_preview():
             v = q.get("variations", {}).get(variant)
             if not v:
                 continue
-            st.markdown(f"**Variasi Lebih {label}**\n\n{v.get('question_text', '')}")
+            st.markdown(f"**Variasi Lebih {label}**\n\n{normalize_latex(v.get('question_text', ''))}")
             for i, opt in enumerate(v.get("options") or []):
                 st.markdown(f"- **{chr(65 + i)}.** {opt}")
             for key, title in (("solution_by_concept", "Penyelesaian (Konsep Dasar)"),
                                ("solution_by_trick", "Penyelesaian (Cara Cepat/Trik)")):
                 solution = v.get(key)
                 if solution:
-                    st.markdown(f"*{title}*\n\n{solution}")
+                    _render_solution(solution, f"*{title}*")
 
 
 def _render_download_and_preview():
@@ -257,9 +264,9 @@ def _render_question(idx, q):
         st.markdown("---")
         st.markdown("### 📝 Pembahasan AI")
         if concept:
-            st.markdown(f"**Penyelesaian (Konsep Dasar)**\n\n{concept}")
+            _render_solution(concept, "**Penyelesaian (Konsep Dasar)**")
         if trick:
-            st.markdown(f"**Penyelesaian (Cara Cepat/Trik)**\n\n{trick}")
+            _render_solution(trick, "**Penyelesaian (Cara Cepat/Trik)**")
     else:
         st.warning("Pembahasan belum tersedia untuk soal ini.")
 
