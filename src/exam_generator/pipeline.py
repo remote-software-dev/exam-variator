@@ -366,40 +366,56 @@ def extract_all_questions_from_text(page_text, custom_instruction=None, status_c
 def _assess_page_text(text):
     """Return (usable, has_markers) for a page's extracted PDF text.
 
-    usable=True means the text is long enough (>= MIN_TEXT_EXTRACTION_CHARS)
-    and looks like real question content (question markers and/or recognizable
-    words), so extraction can skip the vision model. usable=False means the
-    page is empty, or the text is garbage/scrambled, and the caller must fall
-    back to rendering the page and using the vision model.
+    usable=True means the text looks like real question content and can be
+    sent to the cheap TEXT model. usable=False means the page is empty or the
+    text is just a header/garbage, so the caller should use the vision model
+    (or skip the page).
+
+    Question markers ("1.", "A)", ...) are treated as strong evidence of real
+    content even on a short page — a single compact question can easily fit in
+    under MIN_TEXT_EXTRACTION_CHARS. Markerless text still needs the full
+    length AND the word check before it is trusted.
     """
     text = (text or "").strip()
+    has_markers = bool(_QUESTION_MARKER_RE.search(text))
+    if len(text) < max(MIN_TEXT_EXTRACTION_CHARS // 5, 10):
+        return False, False
+    if has_markers:
+        return True, True
     if len(text) < MIN_TEXT_EXTRACTION_CHARS:
         return False, False
-    has_markers = bool(_QUESTION_MARKER_RE.search(text))
     has_words = len(re.findall(r"[A-Za-z]{4,}", text)) >= 3
-    return (has_markers or has_words), has_markers
+    return has_words, has_markers
 
 
-def _extract_pdf_markdown(pdf_path):
+def _extract_pdf_markdown(pdf_path, pages=None):
     """Convert a PDF to clean per-page Markdown locally — free, no AI used.
 
     Uses pymupdf4llm so math formulas ($LaTeX$) and document structure are
     preserved far better than a raw text dump. When pymupdf4llm is not
     installed, falls back to PyMuPDF's raw text extraction (still local and
-    free, just with less structure). Returns a dict mapping the 0-based page
-    index to that page's text. Returns {} when extraction fails so the caller
-    can fall back to rendering each page for the vision model.
+    free, just with less structure).
+
+    Args:
+        pdf_path: Path to the input PDF.
+        pages: Optional iterable of 0-based page indices to convert. When
+            omitted, the whole document is converted.
+
+    Returns a dict mapping the 0-based page index to that page's text. Returns
+    {} when extraction fails so the caller can fall back to rendering each
+    page for the vision model.
     """
     if _PYMUPDF4LLM_AVAILABLE:
         try:
-            chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
-            pages = {}
-            for idx, chunk in enumerate(chunks or []):
-                if isinstance(chunk, dict):
-                    pages[idx] = chunk.get("text", "")
-                else:
-                    pages[idx] = str(chunk)
-            return pages
+            chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True, pages=pages)
+            pages_out = {}
+            if pages is None:
+                for idx, chunk in enumerate(chunks or []):
+                    pages_out[idx] = chunk.get("text", "")
+            else:
+                for req_idx, chunk in zip(pages, chunks or []):
+                    pages_out[req_idx] = chunk.get("text", "")
+            return pages_out
         except Exception as e:
             print(f"  ⚠ pymupdf4llm conversion failed: {e}. "
                   "Falling back to PyMuPDF raw text extraction.")
@@ -409,7 +425,8 @@ def _extract_pdf_markdown(pdf_path):
     try:
         doc = fitz.open(pdf_path)
         try:
-            return {i: doc[i].get_text() for i in range(doc.page_count)}
+            idxs = range(doc.page_count) if pages is None else pages
+            return {i: doc[i].get_text() for i in idxs}
         finally:
             doc.close()
     except Exception as e:
@@ -855,6 +872,71 @@ def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
     doc.close()
 
     return questions, skipped_pages
+
+
+def get_pdf_page_count(pdf_path):
+    """Return the number of pages in a PDF (local, no AI involved)."""
+    import fitz  # PyMuPDF
+
+    with fitz.open(pdf_path) as doc:
+        return doc.page_count
+
+
+def extract_page_questions(pdf_path, page_index, custom_instruction=None,
+                           status_callback=None):
+    """Extract ALL complete questions from ONE page (1-based page_index).
+
+    The on-demand primitive behind the step-by-step app workflow: only this
+    single page is converted and sent to the models, so one click extracts
+    exactly one page — local parse first, cheap TEXT model next, vision only
+    when the page is scanned (no extractable text). No other page is touched,
+    and no rate-limit sleep is inserted (the user drives the pacing).
+
+    Returns a list of question dicts, each carrying a 'page' key set to
+    page_index. Returns an empty list when the page has no questions.
+    """
+    import fitz  # PyMuPDF
+
+    pages_dir = "data/outputs/pages"
+    os.makedirs(pages_dir, exist_ok=True)
+
+    markdown = _extract_pdf_markdown(pdf_path, pages=[page_index - 1])
+    text = markdown.get(page_index - 1, "")
+    usable, has_markers = _assess_page_text(text)
+
+    if usable:
+        print(f"  Page {page_index}: Extracted {len(text)} markdown chars. "
+              f"Contains question markers: {has_markers}. Using cheap TEXT model.")
+        try:
+            questions = extract_all_questions_from_page_text(
+                text,
+                custom_instruction=custom_instruction,
+                status_callback=status_callback,
+            )
+        except RuntimeError:
+            # The text exists but no complete questions could be found on this
+            # page (e.g. a cover/header page). Treat it as empty so the caller
+            # advances to the next page instead of crashing.
+            print(f"  Page {page_index}: no questions found in the text — "
+                  "treating the page as empty.")
+            return []
+    else:
+        page_label = f"page_{page_index:02d}"
+        with fitz.open(pdf_path) as doc:
+            pix = doc[page_index - 1].get_pixmap(dpi=200)
+            page_png = os.path.join(pages_dir, f"{page_label}.png")
+            pix.save(page_png)
+        print(f"  Page {page_index}: no extractable text (scanned image page). "
+              f"Rendering page and using VISION model.")
+        questions = extract_all_questions_from_image(
+            page_png,
+            custom_instruction=custom_instruction,
+            status_callback=status_callback,
+        )
+
+    for q in questions:
+        q["page"] = page_index
+    return questions
 
 
 def _generate_variation_results(questions, start=0, batch_size=None,
