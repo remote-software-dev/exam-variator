@@ -7,6 +7,25 @@ class TestNormalizeLatex:
             r"Gradien = $\frac{12-0}{5-1}$"
         )
 
+    def test_double_backslash_fraction_collapsed(self):
+        assert normalize_latex(r"Gradien = \\frac{12-0}{5-1}") == (
+            r"Gradien = $\frac{12-0}{5-1}$"
+        )
+
+    def test_double_backslash_inside_dollars_collapsed(self):
+        assert normalize_latex(r"Gradien = $\\frac{12-0}{5-1}$") == (
+            r"Gradien = $\frac{12-0}{5-1}$"
+        )
+
+    def test_double_backslash_escaped_delimiters_collapsed(self):
+        assert normalize_latex(r"Gradien = \\(\\frac{12-0}{5-1}\\)") == (
+            r"Gradien = $\frac{12-0}{5-1}$"
+        )
+
+    def test_matrix_row_separator_after_newline_preserved(self):
+        matrix = r"\begin{bmatrix} 1 \\ 2 \end{bmatrix}"
+        assert normalize_latex(matrix) == f"$$\n{matrix}\n$$"
+
     def test_already_delimited_unchanged(self):
         text = r"Gradien = $\frac{12-0}{5-1}$"
         assert normalize_latex(text) == text

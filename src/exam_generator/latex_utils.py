@@ -85,15 +85,42 @@ def _wrap_bare_commands(prose):
     return "".join(out)
 
 
+def _collapse_double_backslashes(text):
+    """Undo model double-escaping (``\\\\frac`` -> ``\\frac``) without touching
+    real LaTeX line breaks such as the row separators in ``\\begin{bmatrix}``.
+
+    A ``\\\\`` is collapsed only when followed by a letter, ``(``/``[``/``)``/``]``
+    or another ``\\`` (i.e. the start/end of another LaTeX command or delimiter).
+    A ``\\\\`` followed by a space or newline is a genuine row separator and is
+    kept.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n and text[i + 1] == "\\":
+            nxt = text[i + 2] if i + 2 < n else ""
+            if nxt in "\\([)]\\" or nxt.isalpha():
+                out.append("\\")
+                i += 2
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
 def normalize_latex(text):
     """Return ``text`` with every LaTeX expression properly delimited.
 
     Already-delimited math (``$...$``, ``$$...$$``, ``\\(...\\)``,
     ``\\[...\\]``, ``\\begin...\\end``) is normalized; bare commands such as
-    ``\\frac{...}{...}`` are wrapped in ``$...$``.
+    ``\\frac{...}{...}`` are wrapped in ``$...$``.  Model double-escaping
+    (``\\\\frac``) is collapsed to a single backslash first, since KaTeX
+    otherwise misreads ``\\\\`` as a line break and renders ``rac`` as letters.
     """
     if not text:
         return text
+    text = _collapse_double_backslashes(text)
     parts = _DELIMITED_MATH_RE.split(text)
     out = []
     for idx, part in enumerate(parts):
