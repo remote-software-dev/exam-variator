@@ -302,8 +302,9 @@ if st.session_state.get("extraction_started"):
 
     if not st.session_state.get("review_complete"):
         # --- Show the current question, one at a time --------------------
+        total_questions = len(log)
         st.markdown(
-            f"### 🧭 Soal {current_idx + 1} dari {total_pages} · "
+            f"### 🧭 Soal {current_idx + 1} dari {total_questions} · "
             f"Halaman {current_page} dari {total_pages}"
         )
         st.progress(current_page / total_pages,
@@ -322,13 +323,13 @@ if st.session_state.get("extraction_started"):
             last_of_log = current_idx == total_seen - 1
             last_page = current_page >= total_pages
             if last_of_log and last_page:
-                if st.button("✅ Selesai Meninjau Semua Soal",
+                if st.button("✅ Selesai - Buat Variasi Sekarang",
                              key="finish_review", type="primary",
                              use_container_width=True):
                     st.session_state.review_complete = True
                     st.rerun()
             else:
-                label = f"✅ Soal {current_idx + 1} dari {total_pages} — Lanjutkan ke Soal Berikutnya →"
+                label = f"✅ Soal {current_idx + 1} dari {total_questions} — Lanjutkan ke Soal Berikutnya →"
                 if st.button(label, key="next_q", type="primary",
                              use_container_width=True):
                     _advance(custom_instruction)
