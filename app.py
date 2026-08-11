@@ -54,12 +54,13 @@ def _render_preview():
         if options:
             for i, opt in enumerate(options):
                 st.markdown(f"{chr(65 + i)}. {opt}")
-        for variant in ("easier", "harder"):
-            label = "Mudah" if variant == "easier" else "Sulit"
+        for variant, label in (("easy", "Variasi Mudah"),
+                               ("medium", "Variasi Sedang"),
+                               ("hard", "Variasi Sulit")):
             v = q.get("variations", {}).get(variant)
             if not v:
                 continue
-            st.markdown(f"**Variasi Lebih {label}**\n\n{normalize_latex(v.get('question_text', ''))}")
+            st.markdown(f"**{label}**\n\n{normalize_latex(v.get('question_text', ''))}")
             for i, opt in enumerate(v.get("options") or []):
                 st.markdown(f"- **{chr(65 + i)}.** {opt}")
             for key, title in (("solution_by_concept", "Penyelesaian (Konsep Dasar)"),
@@ -335,30 +336,70 @@ if st.session_state.get("extraction_started"):
                     _advance(custom_instruction)
                     st.rerun()
     else:
-        # --- All pages reviewed -------------------------------------------
+        # --- All pages reviewed: full list with selectable checkboxes ------
         st.markdown(
             f"### 🎉 Semua halaman telah ditinjau ({total_seen} soal diekstrak)"
-        )
-        selected = [
-            q for i, q in enumerate(log)
-            if st.session_state.get(f"sel_{i}")
-        ]
-        st.markdown(
-            f"**{len(selected)} dari {total_seen} soal** dipilih untuk divariasikan."
         )
         if st.button("← Kembali Meninjau Soal", use_container_width=True):
             st.session_state.review_complete = False
             st.session_state.current_idx = max(0, total_seen - 1)
             st.rerun()
 
+        st.markdown(
+            "Centang (☑) soal yang ingin dibuatkan variasinya — counter di bawah "
+            "menghitung pilihan Anda secara langsung. Pembahasan AI untuk tiap soal "
+            "dapat dibuka lewat panel di bawahnya."
+        )
+
+        for i, q in enumerate(log):
+            page_note = f" (Halaman {q['page']})" if q.get("page") else ""
+            title = f"Soal {i + 1}{page_note}"
+            if q.get("id"):
+                title += f" — {q['id']}"
+            with st.container(border=True):
+                col_check, col_body = st.columns([1, 8], vertical_alignment="top")
+                with col_check:
+                    st.checkbox(
+                        "Pilih soal ini untuk divariasikan",
+                        key=f"sel_{i}",
+                        value=st.session_state.get(f"sel_{i}", True),
+                        label_visibility="collapsed",
+                    )
+                with col_body:
+                    st.markdown(f"**{title}**")
+                    st.markdown(q.get("question_text", ""))
+                    for opt_i, opt in enumerate(q.get("options") or []):
+                        st.markdown(f"{chr(65 + opt_i)}. {opt}")
+                concept = q.get("solution_by_concept")
+                trick = q.get("solution_by_trick")
+                if concept or trick:
+                    with st.expander("📝 Pembahasan AI", expanded=True):
+                        if concept:
+                            _render_solution(
+                                concept, "**Penyelesaian (Konsep Dasar)**")
+                        if trick:
+                            _render_solution(
+                                trick, "**Penyelesaian (Cara Cepat/Trik)**")
+                else:
+                    st.warning("Pembahasan belum tersedia untuk soal ini.")
+
+        selected = [
+            q for i, q in enumerate(log)
+            if st.session_state.get(f"sel_{i}")
+        ]
+        st.session_state.selected_questions = selected
+
+        st.markdown(
+            f"**{len(selected)} dari {total_seen} soal** dipilih untuk divariasikan."
+        )
         if not selected:
             st.warning("Pilih minimal satu soal terlebih dahulu.")
-        if selected and st.button(
+        if st.button(
             "🚀 Buat Variasi untuk Soal Terpilih",
             type="primary",
             use_container_width=True,
+            disabled=len(selected) == 0,
         ):
-            st.session_state.selected_questions = selected
             _run_variation(custom_instruction)
             st.session_state.variation_done = True
             st.rerun()
