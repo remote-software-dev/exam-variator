@@ -542,14 +542,15 @@ def extract_all_questions_from_page_text(page_text, custom_instruction=None,
     )
 
 def generate_variations(original_q, custom_instruction=None, status_callback=None):
-    print("  [2/4] Generating easier and harder variations via LiteLLM (with fallbacks)...")
+    print("  [2/4] Generating easy/medium/hard variations via LiteLLM (with fallbacks)...")
 
     system_prompt = (
         "You are a math exam question writer for Indonesian secondary schools.\n"
-        "Given an original multiple-choice question, produce two variations: 'easier' and 'harder'.\n\n"
+        "Given an original multiple-choice question, produce three variations: "
+        "'easy', 'medium', and 'hard'.\n\n"
         "STRICT FORMAT RULES:\n"
         "- Return ONLY a valid JSON object.\n"
-        "- Top-level keys: 'easier' and 'harder'.\n"
+        "- Top-level keys: 'easy', 'medium' and 'hard'.\n"
         "- Each variation must contain:\n"
         "  * 'question_text': string (the question stem)\n"
         "  * 'options': array of exactly 5 strings (labeled A through E in the output)\n"
@@ -564,8 +565,9 @@ def generate_variations(original_q, custom_instruction=None, status_callback=Non
         "- Do NOT include option labels (A., B., etc.) inside the option strings — just the answer text.\n"
         "- Use LaTeX math notation enclosed in $ delimiters for all formulas.\n"
         f"- {MATRIX_FORMATTING_RULES}\n"
-        "- Keep the same mathematical topic and difficulty relative to the label (easier = simpler numbers/steps, "
-        "harder = more complex numbers/steps or additional concepts).\n"
+        "- Keep the same mathematical topic and difficulty relative to the label "
+        "(easy = simplest numbers/steps, medium = the original level with minor "
+        "adjustments, hard = more complex numbers/steps or additional concepts).\n"
         "- Preserve the original Indonesian language.\n"
         "- Use double quotes for all JSON keys and string values.\n"
         "- Do NOT wrap the JSON in markdown code fences."
@@ -582,7 +584,7 @@ def generate_variations(original_q, custom_instruction=None, status_callback=Non
 
     user_prompt = (
         f"Original question:\n{json.dumps(original_q, ensure_ascii=False, indent=2)}\n\n"
-        "Generate the 'easier' and 'harder' variations now."
+        "Generate the 'easy', 'medium' and 'hard' variations now."
     )
 
     last_error = None
@@ -599,7 +601,7 @@ def generate_variations(original_q, custom_instruction=None, status_callback=Non
             )
             raw = response.choices[0].message.content
             result = _extract_json(raw)
-            if result and "easier" in result and "harder" in result:
+            if result and all(k in result for k in ("easy", "medium", "hard")):
                 return result
             print(f"  ⚠ {model} returned invalid variation structure, trying next...")
         except Exception as e:
@@ -942,7 +944,7 @@ def extract_page_questions(pdf_path, page_index, custom_instruction=None,
 def _generate_variation_results(questions, start=0, batch_size=None,
                                 custom_instruction=None, progress_callback=None,
                                 status_callback=None):
-    """Shared engine that generates easier/harder variations for a question slice.
+    """Shared engine that generates easy/medium/hard variations for a question slice.
 
     This is the single implementation behind generate_variation_batch and
     generate_variation_results. When batch_size is None, every question from
@@ -991,7 +993,7 @@ def _generate_variation_results(questions, start=0, batch_size=None,
 
 def generate_variation_batch(questions, start, batch_size, custom_instruction=None,
                              progress_callback=None, status_callback=None):
-    """Generate easier/harder variations for questions[start:start + batch_size].
+    """Generate easy/medium/hard variations for questions[start:start + batch_size].
 
     Progress uses the global question index (start + offset + 1) so batching
     over the whole exam keeps the count continuous across batches.
@@ -1008,7 +1010,7 @@ def generate_variation_batch(questions, start, batch_size, custom_instruction=No
 
 def generate_variation_results(questions, custom_instruction=None, progress_callback=None,
                                status_callback=None):
-    """Generate easier/harder variations for an already-selected list of questions.
+    """Generate easy/medium/hard variations for an already-selected list of questions.
 
     Thin wrapper around _generate_variation_results that processes the whole
     list in one pass.

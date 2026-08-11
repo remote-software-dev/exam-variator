@@ -15,7 +15,11 @@ def _sample_question(idx):
 
 
 def _fake_variations(original_q, custom_instruction=None, status_callback=None):
-    return {"easier": {"question_text": "e"}, "harder": {"question_text": "h"}}
+    return {
+        "easy": {"question_text": "e"},
+        "medium": {"question_text": "m"},
+        "hard": {"question_text": "h"},
+    }
 
 
 def _make_pdf(tmp_path, page_texts):
@@ -555,7 +559,7 @@ class TestBatching:
         results = pipeline.generate_variation_batch(questions, start=2, batch_size=2)
         assert [r["original"]["id"] for r in results] == ["Q2", "Q3"]
         assert results[0]["page"] == 1
-        assert results[0]["variations"]["easier"]["question_text"] == "e"
+        assert results[0]["variations"]["easy"]["question_text"] == "e"
 
     def test_generate_variation_batch_progress_uses_global_index(self, monkeypatch):
         monkeypatch.setattr(pipeline, "generate_variations", _fake_variations)

@@ -52,13 +52,18 @@ class TestBuildMarkdown:
                 "options": ["o1", "o2", "o3", "o4", "o5"],
             },
             "variations": {
-                "easier": {
+                "easy": {
                     "question_text": "Soal mudah?",
                     "options": ["op1", "op2", "op3", "op4", "op5"],
                     "solution_by_concept": "Langkah 1",
                     "solution_by_trick": "Trik cepat",
                 },
-                "harder": {
+                "medium": {
+                    "question_text": "Soal sedang?",
+                    "options": ["m1", "m2", "m3", "m4", "m5"],
+                    "solution_by_concept": "Langkah sedang",
+                },
+                "hard": {
                     "question_text": "Soal sulit?",
                     "options": ["a", "b", "c", "d", "e"],
                     "solution_by_concept": "Langkah sulit",
@@ -74,9 +79,11 @@ class TestBuildMarkdown:
         assert "### Soal Asli" in md
         assert "Soal asli?" in md
         assert "- **A.** o1" in md
-        assert "### Variasi Lebih Mudah" in md
+        assert "### Variasi Mudah" in md
         assert "Soal mudah?" in md
-        assert "### Variasi Lebih Sulit" in md
+        assert "### Variasi Sedang" in md
+        assert "Soal sedang?" in md
+        assert "### Variasi Sulit" in md
         assert "**Penyelesaian (Konsep Dasar):**" in md
         assert "Langkah 1" in md
         assert "**Penyelesaian (Cara Cepat/Trik):**" in md
@@ -98,8 +105,8 @@ class TestBuildMarkdown:
 
     def test_empty_solutions_are_omitted(self):
         item = self._item()
-        item["variations"]["easier"]["solution_by_concept"] = "  "
-        item["variations"]["easier"]["solution_by_trick"] = ""
+        item["variations"]["easy"]["solution_by_concept"] = "  "
+        item["variations"]["easy"]["solution_by_trick"] = ""
         md = exporter.build_markdown([item])
         assert "Langkah 1" not in md
         assert "Trik cepat" not in md

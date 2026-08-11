@@ -34,6 +34,14 @@ _SOLUTION_TITLES = {
     "solution_by_trick": "Penyelesaian (Cara Cepat/Trik)",
 }
 
+# The three difficulty levels, in display order. Keys match the 'variations'
+# dict produced by pipeline.generate_variations.
+_VARIATION_LABELS = {
+    "easy": "Variasi Mudah",
+    "medium": "Variasi Sedang",
+    "hard": "Variasi Sulit",
+}
+
 
 def _sanitize_option(text):
     """Collapse newlines inside a single option so it stays on one line."""
@@ -63,12 +71,11 @@ def build_markdown(questions):
                 lines.append(f"- **{chr(65 + i)}.** {_sanitize_option(opt)}")
             lines.append("")
 
-        for variant in ("easier", "harder"):
-            label = "Mudah" if variant == "easier" else "Sulit"
+        for variant, label in _VARIATION_LABELS.items():
             if variant not in variations:
                 continue
             vdata = variations[variant]
-            lines += [f"### Variasi Lebih {label}", "",
+            lines += [f"### {label}", "",
                       vdata.get("question_text", "").strip(), ""]
             vopts = vdata.get("options") or []
             for i, opt in enumerate(vopts):
@@ -346,11 +353,10 @@ def _export_with_python_docx(questions, output_path):
                     doc, f"**{chr(65 + i)}.** {_sanitize_option(opt)}",
                     latex_to_mathml, bullet=True)
 
-        for variant in ("easier", "harder"):
-            label = "Mudah" if variant == "easier" else "Sulit"
+        for variant, label in _VARIATION_LABELS.items():
             if variant not in variations:
                 continue
-            doc.add_heading(f"Variasi Lebih {label}", level=3)
+            doc.add_heading(label, level=3)
             _add_rich_paragraph(
                 doc, variations[variant].get("question_text", ""),
                 latex_to_mathml)

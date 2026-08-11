@@ -1,13 +1,13 @@
 # 🎓 Exam Variator (Generator Variasi Soal)
 
-Automatically extracts math exam questions from PDF, generates easier and harder variations with AI, and exports the results to a Word document.
+Automatically extracts math exam questions from PDF, generates easy, medium and hard variations with AI, and exports the results to a Word document.
 
 ## Features
 
 - **Extract all questions** — every page is processed **TEXT-first**: the text is pulled straight out of the PDF with PyMuPDF and extracted via the cheap text model chain (no image, no vision rate limits). Only pages whose text is missing or garbled (empty, or no question markers like `1.` / `A.` / `B.`) are rendered to PNG and sent to the vision model. Each page is retried with exponential backoff until it succeeds, so a transient failure never silently skips a page.
 - **AI pembahasan (solutions)** — each question gets a step-by-step solution in two styles: `solution_by_concept` (basic concept) and `solution_by_trick` (quick trick), previewed in the UI so you can verify the AI solves each question correctly.
 - **Two-phase selection flow** — phase 1 extracts + solves everything; phase 2 lets you review and check the questions you actually want to vary before generating variations.
-- **AI variations** — each selected question gets 2 variations: *easier* and *harder*, each with 5 answer options (A–E).
+- **AI variations** — each selected question gets 3 difficulty levels: *easy* (Mudah), *medium* (Sedang) and *hard* (Sulit), each with 5 answer options (A–E).
 - **Hybrid LLM fallback chain** — every LLM call tries models in order (Groq first, Gemini as the safety net) and rate limits are retried with exponential backoff before falling through to the next provider.
 - **Strict LaTeX matrix formatting** — the AI prompt enforces `\begin{bmatrix} ... \end{bmatrix}` (with a few-shot example) so matrices are never rendered as `|`, `||`, `∨`, or plain-text arrays.
 - **Custom instructions** — add instructions like "provide solutions using the basic concept and a quick trick" to steer the pembahasan and variation output.
