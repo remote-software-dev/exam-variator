@@ -6,3 +6,8 @@ groq
 python-dotenv
 litellm
 pytest>=8.0.0
+
+# Optional OCR engines (install one for scanned page support):
+# pytesseract>=0.3.10  (also requires Tesseract binary: apt install tesseract-ocr tesseract-ocr-ind)
+# paddleocr>=2.7.0
+# easyocr>=1.7.0

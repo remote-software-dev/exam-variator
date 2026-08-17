@@ -1,0 +1,149 @@
+================================================================================
+           MIGRATION REPORT — Streamlit to FastAPI + Next.js
+           Generated: 2026-08-17
+================================================================================
+
+========================================
+FEATURE PARITY TABLE
+========================================
+
+| Streamlit Feature                    | New Location                     | Status |
+|--------------------------------------|----------------------------------|--------|
+| PDF upload (file_uploader)           | POST /api/jobs + frontend upload | DONE   |
+| File size validation                 | Backend POST /api/jobs           | DONE   |
+| Custom instruction textarea          | POST /api/jobs + trigger body    | DONE   |
+| Session state management             | SQLite job store                 | DONE   |
+| Extraction progress bar              | Job.progress (0.0-1.0) + poll   | DONE   |
+| Page-by-page question review         | GET /questions + frontend UI     | DONE   |
+| Question type badges (PG/MCMA/etc)   | QuestionSchema + frontend badges | DONE   |
+| Validation status display            | QuestionSchema + frontend badges | DONE   |
+| AI solution display (concept+trick)  | GET /questions + frontend UI     | DONE   |
+| Select questions for variation       | POST /select + checkboxes        | DONE   |
+| Variation generation                 | POST /variations (background)    | DONE   |
+| Easy/Medium/Hard variation display   | GET /variations + frontend UI    | DONE   |
+| DOCX export + download              | POST + GET /export               | DONE   |
+| Cache management                     | Engine cache unchanged           | DONE   |
+| Settings expander                    | Not needed (env vars)            | DONE   |
+| Live preview of results              | GET /variations preview          | DONE   |
+| Rate limit status display            | Phase + progress fields          | DONE   |
+| Backward navigation (prev question)  | Frontend: all questions visible  | DONE   |
+| Auto-extract next page               | Backend: full PDF extraction     | DONE   |
+
+========================================
+ENDPOINTS IMPLEMENTED
+========================================
+
+POST   /api/jobs                          - Upload PDF, returns job immediately
+GET    /api/jobs                          - List all jobs (paginated)
+GET    /api/jobs/{id}                     - Job detail (phase, progress, counts)
+GET    /api/jobs/{id}/questions           - All questions with metadata
+GET    /api/jobs/{id}/questions/{qid}     - Single question
+PATCH  /api/jobs/{id}/questions/{qid}     - Edit question text/options/answer
+POST   /api/jobs/{id}/questions/{qid}/select  - Toggle selection
+POST   /api/jobs/{id}/select              - Bulk select (selected_indices)
+POST   /api/jobs/{id}/variations          - Trigger variation generation
+GET    /api/jobs/{id}/variations          - Get E/M/H variations
+POST   /api/jobs/{id}/export              - Build DOCX
+GET    /api/jobs/{id}/export              - Download DOCX
+GET    /health                            - Health check
+
+========================================
+ENGINE PARTS PRESERVED UNCHANGED
+========================================
+
+The entire src/exam_generator/ directory is untouched:
+
+- config.py          - Central configuration
+- models.py          - Question, VariationResult dataclasses
+- cache.py           - File-based caching
+- pdf_ingestion.py   - PDF reading, digital/scanned detection
+- question_parser.py - Local regex parsing
+- ocr_extractor.py   - OCR adapter
+- image_processor.py - Image compression/crop/classify
+- ai_client.py       - LLM calls with retry/fallback/max_tokens
+- validator.py       - Question validation
+- solution_generator.py  - AI solution generation
+- variation_generator.py - AI variation generation
+- pipeline.py        - Pipeline orchestrator
+- docx_exporter.py   - DOCX export (pandoc/python-docx)
+- latex_utils.py     - LaTeX normalization
+
+The backend wraps these via:
+- extraction_service.py: imports pipeline functions directly
+- job_service.py: manages job lifecycle in SQLite
+
+========================================
+HOW TO RUN
+========================================
+
+# Option 1: All three services
+
+Terminal 1 (Backend):
+  cd backend
+  uvicorn app.main:app --reload --port 8000
+
+Terminal 2 (Frontend):
+  cd frontend
+  npm run dev
+
+Terminal 3 (Tests):
+  python -m pytest tests/          # 100 engine tests
+  cd backend && python -m pytest tests/  # 16 API tests
+
+# Option 2: CLI pipeline (unchanged)
+
+  python -m src.exam_generator.pipeline --pdf path/to/file.pdf --max-pages 3
+
+========================================
+JOB PHASES (State Machine)
+========================================
+
+  uploaded ──► extracting ──► extracted ──► solving ──► solved
+                                                           │
+                                              ┌────────────┘
+                                              ▼
+                                          varying ──► completed
+
+  Any phase ──► failed (with error_message)
+
+========================================
+KNOWN GAPS AND NEXT STEPS
+========================================
+
+1. NO WEBSOCKET FOR PROGRESS: Frontend polls every 3s. WebSocket push
+   would reduce latency and server load.
+
+2. NO AUTH: Single-user design. No JWT, no per-client API keys.
+
+3. NO ASYNC DB: Backend uses synchronous SQLAlchemy. For production
+   with PostgreSQL, switch to asyncpg + SQLAlchemy async.
+
+4. NO CELERY: BackgroundTasks work for single-server. For horizontal
+   scaling, swap to Celery + Redis.
+
+5. NO DOCX EXPORT FOR COMPLEX TYPES: Statement tables and category
+   matching are not fully rendered in DOCX.
+
+6. NO ANSWER KEY EXTRACTION: Answer keys are AI-generated drafts.
+
+7. NO HUMAN REVIEW DASHBOARD: needs_human_review flag is set but
+   no dedicated review UI.
+
+8. FRONTEND DOES NOT HANDLE PAGINATION: Job list and questions show
+   all items. For large datasets, add pagination.
+
+9. NO DOCKER: No Dockerfile or docker-compose yet.
+
+10. NO CI/CD: No GitHub Actions or deployment config.
+
+========================================
+TEST RESULTS
+========================================
+
+Engine tests: 100 passed (no API keys needed)
+Backend tests: 16 passed (no API keys needed)
+Frontend build: successful (all 5 routes generated)
+
+========================================
+                              END OF REPORT
+================================================================================

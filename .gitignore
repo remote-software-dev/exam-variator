@@ -5,7 +5,8 @@ env/
 
 # Environment Variables (NEVER commit your API keys!)
 .env
-.streamlit/secrets.toml
+.env.local
+.streamlit/
 
 # Python cache
 __pycache__/
@@ -16,11 +17,25 @@ __pycache__/
 .vscode/
 .idea/
 
-# Temporary files and large outputs
-*.tmp
+# Runtime data
+data/cache/
+data/jobs/
+data/outputs/pages/
+data/outputs/extracted_images/
 data/outputs/*.png
 data/outputs/*.md
 data/outputs/*.docx
 data/outputs/*.json
-data/outputs/pages/
 data/inputs/*.pdf
+
+# Backend
+backend/test_jobs.db
+backend/data/
+backend/__pycache__/
+backend/app/__pycache__/
+backend/tests/__pycache__/
+
+# Frontend
+frontend/.next/
+frontend/node_modules/
+frontend/out/

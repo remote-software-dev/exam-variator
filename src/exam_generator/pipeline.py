@@ -1,381 +1,109 @@
+"""Pipeline orchestrator for the exam-variator.
+
+This is the main entry point that coordinates all modules:
+- PDF ingestion (local-first)
+- Local question extraction
+- OCR fallback for scanned pages
+- AI solution generation
+- AI variation generation
+- Validation
+- DOCX export
+
+Backward-compatible: preserves the same public API as the original pipeline.
+"""
+
 import os
 import sys
 import json
-import base64
-import re
 import time
 import argparse
-import litellm
-from dotenv import load_dotenv
-from litellm.exceptions import RateLimitError
+from typing import Callable, List, Optional, Tuple
 
-# Optional: pymupdf4llm converts PDFs to clean Markdown locally (free, no AI).
-# It is in requirements.txt, but if it is missing (e.g. an old environment)
-# we degrade gracefully to raw PyMuPDF text extraction instead of crashing.
-try:
-    import pymupdf4llm
-    _PYMUPDF4LLM_AVAILABLE = True
-except ImportError:
-    pymupdf4llm = None
-    _PYMUPDF4LLM_AVAILABLE = False
+from .config import (
+    RETRY_CONFIG, LOCAL_CONFIG, OUTPUT_CONFIG, IMAGE_CONFIG,
+    EXTRACTION_MODELS, TEXT_EXTRACTION_MODELS,
+    MATRIX_FORMATTING_RULES,
+)
+from .models import (
+    Question, VariationResult, PageInfo, ExtractionMethod,
+    ValidationStatus, ExtractedImage,
+)
+from .pdf_ingestion import (
+    get_pdf_page_count, detect_page_type, extract_page_markdown,
+    render_page_to_image, extract_embedded_images,
+)
+from .question_parser import extract_questions_from_markdown
+from .ocr_extractor import is_ocr_available, ocr_page, assess_ocr_quality
+from .image_processor import prepare_image_for_ai, classify_image_type
+from .ai_client import (
+    call_with_fallback, build_extraction_system_prompt,
+    build_vision_message, encode_image,
+)
+from .solution_generator import generate_solution, solve_questions as _solve_questions
+from .variation_generator import (
+    generate_variation_batch as _generate_variation_batch,
+    generate_all_variations,
+)
+from .validator import validate_batch, validate_question
+from .cache import (
+    cache_page_extraction, get_cached_page_extraction,
+    cache_ocr_result, get_cached_ocr_result,
+)
 
-# Add the project root to the path so we can import modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
-# Import the Markdown-aware DOCX exporter (relative when run as a package,
-# absolute when this file is executed directly as a script).
+# Import DOCX exporter (backward-compatible)
 try:
     from .docx_exporter import export_docx
 except ImportError:
     from docx_exporter import export_docx
 
-load_dotenv()
 
-# Fallback: load secrets from Streamlit Cloud if .env is missing.
-# LiteLLM reads the provider keys from the environment automatically, so we
-# just make sure GROQ (and Gemini, via GEMINI_API_KEY or GOOGLE_API_KEY) are set.
-def _ensure_api_key(env_name):
-    if env_name in os.environ:
-        return
-    try:
-        import streamlit as st
-        os.environ[env_name] = st.secrets[env_name]
-    except Exception:
-        pass
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases for the old API
+# ---------------------------------------------------------------------------
 
-_ensure_api_key("GROQ_API_KEY")
-_ensure_api_key("GEMINI_API_KEY")
-_ensure_api_key("GOOGLE_API_KEY")
+# These allow existing code that imports from pipeline to keep working.
+# New code should use the new module interfaces directly.
 
-# Hybrid model fallback chain: tries models in order until one succeeds.
-# Pages are processed TEXT-first (see extract_all_questions_from_pdf), so the
-# vision model below is only used when a page's text is missing or garbled.
-# Gemini is the safety net: its large free tier means a Groq rate limit falls
-# through instead of stalling the pipeline. The Gemini free tier caps usage at
-# 20 requests/day PER MODEL, so the chain spans several Gemini models — each
-# has its own separate daily budget.
-EXTRACTION_MODELS = [
-    "groq/qwen/qwen3.6-27b",
-    "gemini/gemini-3.6-flash",
-    "gemini/gemini-3-flash-preview",
-    "gemini/gemini-3.1-flash-lite",
+# Re-export config values that were previously module-level constants
+EXTRACTION_DELAY_SECONDS = RETRY_CONFIG.extraction_delay_seconds
+RATE_LIMIT_MAX_RETRIES = RETRY_CONFIG.rate_limit_max_retries
+RATE_LIMIT_BACKOFF_SECONDS = RETRY_CONFIG.rate_limit_backoff_seconds
+PAGE_MAX_RETRIES = RETRY_CONFIG.page_max_retries
+PAGE_BACKOFF_SECONDS = RETRY_CONFIG.page_backoff_seconds
+MIN_TEXT_EXTRACTION_CHARS = LOCAL_CONFIG.min_text_chars
+LOCAL_PARSING_ENABLED = LOCAL_CONFIG.local_parsing_enabled
+
+# Re-export model chains
+__all__ = [
+    "run_pipeline", "extract_all_questions_from_pdf", "extract_page_questions",
+    "get_pdf_page_count", "generate_variation_results", "generate_variation_batch",
+    "export_results", "solve_questions", "generate_variations",
+    "generate_solution", "encode_image", "_extract_json",
+    "EXTRACTION_MODELS", "TEXT_EXTRACTION_MODELS", "VARIATION_MODELS", "SOLUTION_MODELS",
+    "MATRIX_FORMATTING_RULES",
 ]
 
-# Text-first extraction models (no vision required). Used for the pages whose
-# text is readable straight out of the PDF — cheap and fast, and it keeps the
-# vision model (and its rate limits) as the exception rather than the default.
-#
-# LOCAL-FIRST STRATEGY: pages are converted to clean Markdown locally with
-# pymupdf4llm (free, no AI), parsed offline when possible, and only otherwise
-# sent here to a fast, cheap TEXT-ONLY model. llama-3.1-8b-instant heads the
-# chain because it is the cheapest/fastest; if it returns unusable JSON the
-# fallback chain escalates to the larger models below. Groq text models first;
-# Gemini only as a last resort (daily caps are small).
-TEXT_EXTRACTION_MODELS = [
-    "groq/llama-3.1-8b-instant",
-    "groq/llama-3.3-70b-versatile",
-    "groq/openai/gpt-oss-120b",
-    "gemini/gemini-3.6-flash",
-    "gemini/gemini-3-flash-preview",
-    "gemini/gemini-3.1-flash-lite",
-]
 
-VARIATION_MODELS = [
-    "groq/llama-3.3-70b-versatile",
-    "groq/openai/gpt-oss-120b",
-    "gemini/gemini-3.6-flash",
-    "gemini/gemini-3-flash-preview",
-    "gemini/gemini-3.1-flash-lite",
-]
+# ---------------------------------------------------------------------------
+# Local extraction functions (backward-compatible)
+# ---------------------------------------------------------------------------
 
-# Models used to generate the solution discussion (pembahasan) shown in the
-# preview so the user can verify how the AI solves each question.
-SOLUTION_MODELS = [
-    "groq/llama-3.3-70b-versatile",
-    "groq/openai/gpt-oss-120b",
-    "gemini/gemini-3.6-flash",
-    "gemini/gemini-3-flash-preview",
-    "gemini/gemini-3.1-flash-lite",
-]
+def _extract_pdf_markdown(pdf_path: str, pages=None):
+    """Convert PDF to per-page Markdown. Backward-compatible wrapper."""
+    from .pdf_ingestion import extract_all_pages_markdown
 
-# Pause between pages to stay under the Groq free-tier TPM rate limit.
-EXTRACTION_DELAY_SECONDS = 10.0
+    page_indices = None
+    if pages is not None:
+        page_indices = pages
 
-# On a RateLimitError, retry the SAME model briefly with exponential backoff
-# (15s -> 30s), then re-raise so the caller falls through to the NEXT model
-# (e.g. Gemini) instead of being stuck on a rate-limited provider.
-RATE_LIMIT_MAX_RETRIES = 3
-RATE_LIMIT_BACKOFF_SECONDS = 15.0
+    result = extract_all_pages_markdown(pdf_path, max_pages=None)
+    if page_indices is not None:
+        return {i: result.get(i, "") for i in page_indices}
+    return result
 
-# Hard cap on retrying the exact same page before logging a clear warning and
-# moving on. Page waits use exponential backoff: 15s, 30s, 60s, 120s.
-PAGE_MAX_RETRIES = 5
-PAGE_BACKOFF_SECONDS = 15.0
-
-# A page's text must be at least this long before we trust it as real content;
-# anything shorter is treated as empty/blank and sent to the vision model.
-MIN_TEXT_EXTRACTION_CHARS = 50
-
-# Signals that a page is real question content: numbered items ("1."), option
-# labels ("A." / "A)"), statement items for Benar/Salah tables ("(1)"), or the
-# literal word "Pernyataan".
-_QUESTION_MARKER_RE = re.compile(
-    r"(?m)(^\s*\d{1,3}\s*\.|\b[A-E]\s*[\.\)]|\bPernyataan\b|\(\s*\d\s*\))"
-)
-
-# When True, readable pages are parsed locally (offline, zero LLM cost) before
-# any LLM is consulted. Set to False to always use the TEXT LLM extraction.
-LOCAL_PARSING_ENABLED = True
-
-# Local parser regexes (heuristic, no LLM involved).
-# Preferred question delimiter: printed question IDs, e.g. 25ABC...-123456-1234.
-_LOCAL_QID_RE = re.compile(r"(?m)(25[A-Z0-9]{14}-\d{6}-\d{4})")
-# Fallback delimiter: numbered items at the start of a line ("1." / "1)").
-_LOCAL_NUMBERED_RE = re.compile(r"(?m)^\s*(\d{1,3})\s*[\.\)]")
-# Option label at the start of a line.
-_LOCAL_OPTION_RE = re.compile(r"(?m)^\s*([A-E])\s*[\.\)]\s*(.*)")
-
-
-def _is_daily_quota_error(error):
-    """True when a RateLimitError comes from a DAILY (per-project per-model) cap.
-
-    Google's per-day free-tier caps (e.g. 20 requests/day/model) never reset
-    within a run, so retrying with backoff is pointless — fail fast so the
-    fallback chain moves to the next model immediately. Per-minute rate limits
-    (TPM/RPM) are NOT flagged here: they reset and are worth retrying.
-    """
-    msg = str(getattr(error, "message", "") or error)
-    return "PerDay" in msg or "per_day" in msg or "dailyLimitExceeded" in msg
-
-
-def _completion_with_retry(model, messages, status_callback=None, **kwargs):
-    """Call litellm.completion, briefly retrying the same model on RateLimitError.
-
-    Waits are exponential (15s -> 30s). After RATE_LIMIT_MAX_RETRIES the
-    RateLimitError is re-raised so the caller's fallback chain moves to the
-    NEXT model (e.g. from rate-limited Groq to Gemini) rather than stalling on
-    a single provider. Any non-rate-limit exception propagates immediately so
-    the same fallback logic applies.
-
-    A RateLimitError caused by an exhausted DAILY quota is re-raised at once
-    (no backoff wait) — sleeping would just burn time on a cap that won't
-    reset until the next day.
-
-    status_callback: optional callable(message) notified before each wait so
-    the UI can show that the app is still working.
-    """
-    delay = RATE_LIMIT_BACKOFF_SECONDS
-    for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 1):
-        try:
-            return litellm.completion(model=model, messages=messages, **kwargs)
-        except RateLimitError as e:
-            if _is_daily_quota_error(e):
-                print(f"  ⚠ {model} daily quota exhausted — skipping backoff, trying next model.")
-                raise
-            if attempt == RATE_LIMIT_MAX_RETRIES:
-                raise
-            message = (
-                f"⏳ Menunggu batas rate limit... (Mencoba lagi dalam {int(delay)} "
-                f"detik, percobaan {attempt}/{RATE_LIMIT_MAX_RETRIES})"
-            )
-            print(f"  {message} — {model}")
-            if status_callback:
-                status_callback(message)
-            time.sleep(delay)
-            delay *= 2
-
-    raise RuntimeError("unreachable")
-
-def encode_image(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
-
-MATRIX_FORMATTING_RULES = (
-    "MATRICES: always use $\\begin{bmatrix} ... \\end{bmatrix}$ LaTeX "
-    "(entries separated by &, rows by \\\\); NEVER '|', '||', '∨', or plain text "
-    "arrays. Example: [[2,0],[0,1/2]] → $\\begin{bmatrix} 2 & 0 \\\\ "
-    "0 & \\frac{1}{2} \\end{bmatrix}$"
-)
-
-def _extract_json(text):
-    """Robustly extract the first JSON object from model output."""
-    match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
-    if not match:
-        match = re.search(r'(\{.*\})', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1).replace("'", '"'))
-        except json.JSONDecodeError:
-            return None
-    return None
-
-def _extraction_system_prompt(custom_instruction, all_questions, source="image"):
-    """Build the shared system prompt for the (single/all) extraction tasks.
-
-    source is "image" (vision extraction from a rendered page) or "text"
-    (extraction from the raw text pulled straight out of the PDF).
-    """
-    source_phrase = (
-        "the clean Markdown text of a PDF page" if source == "text" else "scanned images"
-    )
-    if all_questions:
-        intro = (
-            f"You extract Indonesian math exam questions from {source_phrase}.\n"
-            "Return ONLY a JSON object: {\"questions\": [{\"id\": str, "
-            "\"question_text\": str, \"options\": [str]}]}. Extract EVERY "
-            "complete question visible — do not skip, merge, or omit any.\n\n"
-        )
-    else:
-        intro = (
-            f"You extract Indonesian math exam questions from {source_phrase}.\n"
-            "Return ONLY a JSON object: {\"id\": str, \"question_text\": str, "
-            "\"options\": [str]}.\n\n"
-        )
-
-    rules = (
-        "RULES:\n"
-        "- Formulas in $LaTeX$ (e.g. $\\frac{a}{b}$, $x^2$, $\\sqrt{3}$).\n"
-        f"- {MATRIX_FORMATTING_RULES}\n"
-        "- 'id': the alphanumeric ID printed on the paper; if absent or just a "
-        "number, use 'EXAM-<RANDOM8HEX>'.\n"
-        "- 'options': A/B/C/D/E choices, OR per-statement items for Benar/Salah "
-        "tables (prefix 'Pernyataan N: Benar/Salah') and multi-part stems "
-        "(pernyataan (1),(2),(3)).\n"
-        "- Preserve the original Indonesian language.\n"
-        "- Use double quotes for all JSON keys and string values."
-    )
-
-    if custom_instruction and custom_instruction.strip():
-        rules += (
-            "\n\nADDITIONAL USER INSTRUCTIONS (apply when relevant, e.g. for "
-            "solution styles):\n"
-            f"{custom_instruction.strip()}"
-        )
-
-    return intro + rules
-
-
-def _extract_via_llm(system_prompt, user_text, models, min_keys=None, status_callback=None):
-    """Run the extraction prompt against the model fallback chain."""
-    last_error = None
-    for model in models:
-        try:
-            response = _completion_with_retry(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                temperature=0.1,
-                status_callback=status_callback,
-            )
-            raw = response.choices[0].message.content
-            result = _extract_json(raw)
-            if result:
-                if min_keys and any(k not in result for k in min_keys):
-                    print(f"  ⚠ {model} returned incomplete JSON, trying next...")
-                    continue
-                return result
-            print(f"  ⚠ {model} returned unparseable JSON, trying next...")
-        except Exception as e:
-            last_error = e
-            print(f"  ⚠ {model} failed: {e}, trying next...")
-
-    raise RuntimeError(f"All extraction models failed. Last error: {last_error}")
-
-
-def extract_question_from_image(image_path, custom_instruction=None, status_callback=None):
-    print("  [1/4] Extracting question from image via LiteLLM (with fallbacks)...")
-    base64_image = encode_image(image_path)
-
-    system_prompt = _extraction_system_prompt(custom_instruction, all_questions=False)
-
-    user_content = [
-        {"type": "text", "text": "Extract the first complete question from this image as JSON."},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
-    ]
-
-    return _extract_via_llm(
-        system_prompt,
-        user_content,
-        EXTRACTION_MODELS,
-        min_keys=["id", "question_text"],
-        status_callback=status_callback,
-    )
-
-
-def extract_all_questions_from_image(image_path, custom_instruction=None, status_callback=None):
-    """Extract ALL complete questions from an image. Returns a list of question dicts."""
-    print("  Extracting ALL questions from image via LiteLLM (with fallbacks)...")
-    base64_image = encode_image(image_path)
-
-    system_prompt = _extraction_system_prompt(custom_instruction, all_questions=True)
-
-    user_content = [
-        {"type": "text", "text": "Extract ALL complete questions from this image as JSON."},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
-    ]
-
-    result = _extract_via_llm(
-        system_prompt,
-        user_content,
-        EXTRACTION_MODELS,
-        min_keys=["questions"],
-        status_callback=status_callback,
-    )
-
-    if isinstance(result.get("questions"), list):
-        questions = [q for q in result["questions"]
-                     if isinstance(q, dict) and q.get("question_text")]
-        if questions:
-            return questions
-
-    raise RuntimeError(
-        "Extraction model returned no valid questions for this image."
-    )
-
-def extract_all_questions_from_text(page_text, custom_instruction=None, status_callback=None):
-    """Extract ALL complete questions from a page's raw text (no vision).
-
-    The text is sent to the cheap TEXT model chain, so the vision model is
-    never involved. Returns the same list-of-question-dicts shape as
-    extract_all_questions_from_image.
-    """
-    print("  Extracting ALL questions from page TEXT via LiteLLM (with fallbacks)...")
-    system_prompt = _extraction_system_prompt(custom_instruction, all_questions=True,
-                                              source="text")
-
-    result = _extract_via_llm(
-        system_prompt,
-        page_text,
-        TEXT_EXTRACTION_MODELS,
-        min_keys=["questions"],
-        status_callback=status_callback,
-    )
-
-    if isinstance(result.get("questions"), list):
-        questions = [q for q in result["questions"]
-                     if isinstance(q, dict) and q.get("question_text")]
-        if questions:
-            return questions
-
-    raise RuntimeError(
-        "Text extraction model returned no valid questions for this page."
-    )
 
 def _assess_page_text(text):
-    """Return (usable, has_markers) for a page's extracted PDF text.
-
-    usable=True means the text looks like real question content and can be
-    sent to the cheap TEXT model. usable=False means the page is empty or the
-    text is just a header/garbage, so the caller should use the vision model
-    (or skip the page).
-
-    Question markers ("1.", "A)", ...) are treated as strong evidence of real
-    content even on a short page — a single compact question can easily fit in
-    under MIN_TEXT_EXTRACTION_CHARS. Markerless text still needs the full
-    length AND the word check before it is trusted.
-    """
+    """Assess page text quality. Backward-compatible wrapper."""
     text = (text or "").strip()
     has_markers = bool(_QUESTION_MARKER_RE.search(text))
     if len(text) < max(MIN_TEXT_EXTRACTION_CHARS // 5, 10):
@@ -384,367 +112,345 @@ def _assess_page_text(text):
         return True, True
     if len(text) < MIN_TEXT_EXTRACTION_CHARS:
         return False, False
+    import re
     has_words = len(re.findall(r"[A-Za-z]{4,}", text)) >= 3
     return has_words, has_markers
 
 
-def _extract_pdf_markdown(pdf_path, pages=None):
-    """Convert a PDF to clean per-page Markdown locally — free, no AI used.
-
-    Uses pymupdf4llm so math formulas ($LaTeX$) and document structure are
-    preserved far better than a raw text dump. When pymupdf4llm is not
-    installed, falls back to PyMuPDF's raw text extraction (still local and
-    free, just with less structure).
-
-    Args:
-        pdf_path: Path to the input PDF.
-        pages: Optional iterable of 0-based page indices to convert. When
-            omitted, the whole document is converted.
-
-    Returns a dict mapping the 0-based page index to that page's text. Returns
-    {} when extraction fails so the caller can fall back to rendering each
-    page for the vision model.
-    """
-    if _PYMUPDF4LLM_AVAILABLE:
-        try:
-            chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True, pages=pages)
-            pages_out = {}
-            if pages is None:
-                for idx, chunk in enumerate(chunks or []):
-                    pages_out[idx] = chunk.get("text", "")
-            else:
-                for req_idx, chunk in zip(pages, chunks or []):
-                    pages_out[req_idx] = chunk.get("text", "")
-            return pages_out
-        except Exception as e:
-            print(f"  ⚠ pymupdf4llm conversion failed: {e}. "
-                  "Falling back to PyMuPDF raw text extraction.")
-
-    import fitz  # PyMuPDF
-
-    try:
-        doc = fitz.open(pdf_path)
-        try:
-            idxs = range(doc.page_count) if pages is None else pages
-            return {i: doc[i].get_text() for i in idxs}
-        finally:
-            doc.close()
-    except Exception as e:
-        print(f"  ⚠ PyMuPDF text extraction failed: {e}. "
-              "Falling back to per-page vision extraction.")
-        return {}
-
-
 def parse_questions_from_text(page_text, qid_regex=None):
-    """Heuristically parse MCQ questions from a page's text — no LLM involved.
+    """Parse questions from text. Backward-compatible wrapper."""
+    from .question_parser import parse_questions_from_text as _parse
+    return _parse(page_text, qid_regex=qid_regex)
 
-    Questions are split on printed question IDs (e.g. 25ABC...-123456-1234),
-    or on numbered items ("1.", "2.") when no IDs are present. A block only
-    becomes a question when it has a readable stem AND at least 2 A-E options.
 
-    The parser is deliberately CONSERVATIVE: non-standard layouts (Benar/Salah
-    tables, essay prompts) and jumbled/inline options (two-column layouts) make
-    it return an empty list so the caller falls back to the LLM, rather than
-    exporting a page full of merged or truncated questions.
+# Import the regex for backward compatibility
+import re as _re
+_QUESTION_MARKER_RE = _re.compile(
+    r"(?m)(^\s*\d{1,3}\s*\.|\b[A-E]\s*[\.\)]|\bPernyataan\b|\(\s*\d\s*\))"
+)
 
-    Returns a list of question dicts {"id", "question_text", "options"}, or an
-    empty list when the page can't be parsed reliably.
+
+# ---------------------------------------------------------------------------
+# Image extraction and AI enrichment
+# ---------------------------------------------------------------------------
+
+def _extract_image_descriptions(image_paths: List[str], output_dir: str,
+                                status_callback=None) -> dict:
+    """Describe images using AI. Only called when local methods fail."""
+    from .config import IMAGE_DESCRIPTION_MODELS, TOKEN_LIMITS, TEMPERATURES
+    from .ai_client import build_image_description_prompt
+
+    descriptions = {}
+    system_prompt = build_image_description_prompt()
+
+    for img_path in image_paths:
+        # Check cache first
+        from .cache import get_cached_image_description, cache_image_description
+        cached = get_cached_image_description(img_path)
+        if cached:
+            descriptions[os.path.basename(img_path)] = cached
+            continue
+
+        processed = prepare_image_for_ai(img_path, output_dir)
+        if not processed:
+            continue
+
+        try:
+            user_content = build_vision_message(
+                processed,
+                "Describe this image from an Indonesian math exam."
+            )
+            result = call_with_fallback(
+                models=IMAGE_DESCRIPTION_MODELS,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                max_tokens=TOKEN_LIMITS.image_description,
+                temperature=TEMPERATURES.image_description,
+                min_keys=["description", "image_type"],
+                status_callback=status_callback,
+            )
+            descriptions[os.path.basename(img_path)] = result
+            cache_image_description(img_path, result)
+        except Exception as e:
+            print(f"  Failed to describe image {img_path}: {e}")
+
+    return descriptions
+
+
+# ---------------------------------------------------------------------------
+# Core extraction functions
+# ---------------------------------------------------------------------------
+
+def extract_all_questions_from_image(image_path, custom_instruction=None,
+                                     status_callback=None):
+    """Extract ALL questions from a page image via vision LLM.
+
+    Backward-compatible: same signature as the original.
     """
-    text = (page_text or "").strip()
-    if not text:
-        return []
+    system_prompt = build_extraction_system_prompt(source="image", all_questions=True,
+                                                    custom_instruction=custom_instruction)
+    user_content = build_vision_message(
+        image_path,
+        "Extract ALL complete questions from this image as JSON."
+    )
 
-    qid_re = qid_regex or _LOCAL_QID_RE
-    qid_matches = list(qid_re.finditer(text))
-    if qid_matches:
-        delimiters = qid_matches
-        def get_id(m):
-            return m.group(0)
-    else:
-        numbered = list(_LOCAL_NUMBERED_RE.finditer(text))
-        if not numbered:
-            return []
-        delimiters = numbered
-        def get_id(m):
-            return m.group(1)
+    result = call_with_fallback(
+        models=EXTRACTION_MODELS,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        max_tokens=2048,
+        temperature=0.1,
+        min_keys=["questions"],
+        status_callback=status_callback,
+    )
 
-    blocks = []
-    for idx, m in enumerate(delimiters):
-        start = m.end()
-        end = delimiters[idx + 1].start() if idx + 1 < len(delimiters) else len(text)
-        blocks.append((get_id(m), text[start:end]))
+    if isinstance(result.get("questions"), list):
+        questions_data = [q for q in result["questions"]
+                         if isinstance(q, dict) and q.get("question_text")]
+        if questions_data:
+            from .models import Question, ExtractionMethod
+            return [
+                Question.from_dict({
+                    **q,
+                    "extraction_method": ExtractionMethod.VISION_LLM.value,
+                    "confidence": 0.8,
+                })
+                for q in questions_data
+            ]
 
-    questions = []
-    for qid, body in blocks:
-        stem = []
-        options = []
-        current = None
-        for line in body.splitlines():
-            if not line.strip():
-                continue
-            opt_match = _LOCAL_OPTION_RE.match(line)
-            if opt_match:
-                if current is not None:
-                    options.append(current)
-                current = opt_match.group(2).strip()
-            elif current is not None:
-                current += " " + line.strip()
-            else:
-                stem.append(line.strip())
+    raise RuntimeError("Extraction model returned no valid questions for this image.")
 
-        if current is not None:
-            options.append(current)
 
-        # Reject the whole page when options look jumbled inline (two-column
-        # layouts flattened into one line, e.g. "24 cm B. 28 cm C. 34 cm - D. 36 cm").
-        # Parsing that reliably needs an LLM — return [] so the caller falls back.
-        for opt in options:
-            if re.search(r"(?i)[A-E]\s*[\.\)]\s*\S", opt):
-                return []
+def extract_all_questions_from_text(page_text, custom_instruction=None,
+                                    status_callback=None):
+    """Extract ALL questions from page text via text LLM.
 
-        qtext = " ".join(stem).strip()
-        if len(qtext) < MIN_TEXT_EXTRACTION_CHARS // 5:
-            continue
-        if len(options) < 2:
-            continue
-        questions.append({"id": qid, "question_text": qtext, "options": options})
+    Backward-compatible: same signature as the original.
+    """
+    system_prompt = build_extraction_system_prompt(source="text", all_questions=True,
+                                                    custom_instruction=custom_instruction)
 
-    if not questions:
-        return []
-    # Only trust the parse when we understood most of the page. If the layout
-    # wasn't recognized, most blocks will have failed to parse — falling back
-    # to the (cheap) TEXT LLM beats exporting a page full of merged questions.
-    if len(questions) * 2 < len(delimiters):
-        return []
+    result = call_with_fallback(
+        models=TEXT_EXTRACTION_MODELS,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": page_text},
+        ],
+        max_tokens=2048,
+        temperature=0.1,
+        min_keys=["questions"],
+        status_callback=status_callback,
+    )
 
-    return questions
+    if isinstance(result.get("questions"), list):
+        questions_data = [q for q in result["questions"]
+                         if isinstance(q, dict) and q.get("question_text")]
+        if questions_data:
+            from .models import Question, ExtractionMethod
+            return [
+                Question.from_dict({
+                    **q,
+                    "extraction_method": ExtractionMethod.TEXT_LLM.value,
+                    "confidence": 0.85,
+                })
+                for q in questions_data
+            ]
+
+    raise RuntimeError("Text extraction model returned no valid questions for this page.")
 
 
 def extract_all_questions_from_page_text(page_text, custom_instruction=None,
                                          status_callback=None):
-    """Extract ALL questions from a page's raw text — local-first, LLM fallback.
+    """Extract questions from page text: local parse first, LLM fallback.
 
-    When LOCAL_PARSING_ENABLED, the offline heuristic parser runs first. If it
-    yields questions, no LLM call is made at all. Otherwise the TEXT LLM chain
-    is used. Returns the same list-of-question-dicts shape as the image path.
+    Backward-compatible.
     """
     if LOCAL_PARSING_ENABLED:
         local = parse_questions_from_text(page_text)
         if local:
-            print(f"  ✅ Parsed {len(local)} question(s) locally (no LLM call).")
+            print(f"  Parsed {len(local)} question(s) locally (no LLM call).")
             return local
-        print("  ⚠ Local parsing found no questions — falling back to TEXT LLM.")
+        print("  Local parsing found no questions -- falling back to TEXT LLM.")
 
     return extract_all_questions_from_text(
-        page_text,
-        custom_instruction=custom_instruction,
+        page_text, custom_instruction=custom_instruction,
         status_callback=status_callback,
     )
 
-def generate_variations(original_q, custom_instruction=None, status_callback=None):
-    print("  [2/4] Generating easy/medium/hard variations via LiteLLM (with fallbacks)...")
 
-    system_prompt = (
-        "You are a math exam question writer for Indonesian secondary schools.\n"
-        "Given an original multiple-choice question, produce three variations: "
-        "'easy', 'medium', and 'hard'.\n\n"
-        "STRICT FORMAT RULES:\n"
-        "- Return ONLY a valid JSON object.\n"
-        "- Top-level keys: 'easy', 'medium' and 'hard'.\n"
-        "- Each variation must contain:\n"
-        "  * 'question_text': string (the question stem)\n"
-        "  * 'options': array of exactly 5 strings (labeled A through E in the output)\n"
-        "  * 'solution_by_concept': string (optional) — the solution using the basic "
-        "concept/method, written as detailed markdown.\n"
-        "  * 'solution_by_trick': string (optional) — a quick/shortcut way to solve "
-        "it, written as detailed markdown.\n"
-        "- Only include 'solution_by_concept' / 'solution_by_trick' when the "
-        "ADDITIONAL USER INSTRUCTIONS ask for solution methods.\n"
-        "- Do NOT convert multiple-choice into essay or fill-in-the-blank questions.\n"
-        "- Do NOT change the number of options. Every variation MUST have exactly 5 options.\n"
-        "- Do NOT include option labels (A., B., etc.) inside the option strings — just the answer text.\n"
-        "- Use LaTeX math notation enclosed in $ delimiters for all formulas.\n"
-        f"- {MATRIX_FORMATTING_RULES}\n"
-        "- Keep the same mathematical topic and difficulty relative to the label "
-        "(easy = simplest numbers/steps, medium = the original level with minor "
-        "adjustments, hard = more complex numbers/steps or additional concepts).\n"
-        "- Preserve the original Indonesian language.\n"
-        "- Use double quotes for all JSON keys and string values.\n"
-        "- Do NOT wrap the JSON in markdown code fences."
-    )
+def extract_page_questions(pdf_path, page_index, custom_instruction=None,
+                           status_callback=None):
+    """Extract ALL questions from ONE page (1-based page_index).
 
-    if custom_instruction and custom_instruction.strip():
-        system_prompt += (
-            "\n\nADDITIONAL USER INSTRUCTIONS (follow them exactly for every variation):\n"
-            f"{custom_instruction.strip()}\n"
-            "If these instructions ask for solution methods (e.g. 'by concept' or "
-            "'trick/cara cepat'), produce them under 'solution_by_concept' and "
-            "'solution_by_trick' using markdown (bold, lists, $LaTeX$ math)."
-        )
+    Backward-compatible: same signature as the original.
+    LOCAL-FIRST: text extraction -> local parse -> LLM fallback -> OCR -> vision.
+    """
+    pages_dir = OUTPUT_CONFIG.pages_dir
+    os.makedirs(pages_dir, exist_ok=True)
 
-    user_prompt = (
-        f"Original question:\n{json.dumps(original_q, ensure_ascii=False, indent=2)}\n\n"
-        "Generate the 'easy', 'medium' and 'hard' variations now."
-    )
+    # Check cache
+    cached = get_cached_page_extraction(pdf_path, page_index)
+    if cached:
+        print(f"  Cache hit for page {page_index}")
+        from .models import Question
+        return [Question.from_dict(q) for q in cached.get("questions", [])]
 
-    last_error = None
-    for model in VARIATION_MODELS:
+    # Step 1: Try local text extraction
+    markdown = _extract_pdf_markdown(pdf_path, pages=[page_index - 1])
+    text = markdown.get(page_index - 1, "")
+    usable, has_markers = _assess_page_text(text)
+
+    if usable:
+        print(f"  Page {page_index}: {len(text)} chars, markers={has_markers}. Using local/TEXT LLM.")
         try:
-            response = _completion_with_retry(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.7,
+            questions = extract_all_questions_from_page_text(
+                text, custom_instruction=custom_instruction,
                 status_callback=status_callback,
             )
-            raw = response.choices[0].message.content
-            result = _extract_json(raw)
-            if result and all(k in result for k in ("easy", "medium", "hard")):
-                return result
-            print(f"  ⚠ {model} returned invalid variation structure, trying next...")
-        except Exception as e:
-            last_error = e
-            print(f"  ⚠ {model} failed: {e}, trying next...")
-
-    raise RuntimeError(f"All variation models failed. Last error: {last_error}")
-
-def generate_solution(original_q, custom_instruction=None, status_callback=None):
-    """Generate a solution discussion (pembahasan) for a single question.
-
-    Returns a dict with 'solution_by_concept' and 'solution_by_trick' keys
-    (mirroring the variation format so rendering can be reused).
-    """
-    print("  Generating solution discussion (pembahasan) via LiteLLM (with fallbacks)...")
-
-    system_prompt = (
-        "You are an expert math teacher for Indonesian secondary schools.\n"
-        "Given a question, produce a clear, step-by-step solution discussion "
-        "(pembahasan) that teaches the student HOW to solve it.\n\n"
-        "STRICT FORMAT RULES:\n"
-        "- Return ONLY a valid JSON object.\n"
-        "- Top-level keys: 'solution_by_concept' and 'solution_by_trick'.\n"
-        "  * 'solution_by_concept': string — the full solution using the basic "
-        "concept/method, step by step, written as detailed markdown.\n"
-        "  * 'solution_by_trick': string — a quick/shortcut way to solve it, "
-        "written as detailed markdown. If no real shortcut exists, restate the "
-        "most efficient approach.\n"
-        "- Explain every step and the reasoning behind each transformation; "
-        "state the final answer (key answer) explicitly.\n"
-        "- Use LaTeX math notation enclosed in $ delimiters for all formulas.\n"
-        f"- {MATRIX_FORMATTING_RULES}\n"
-        "- Preserve the original Indonesian language.\n"
-        "- Use double quotes for all JSON keys and string values.\n"
-        "- Do NOT wrap the JSON in markdown code fences."
-    )
-
-    if custom_instruction and custom_instruction.strip():
-        system_prompt += (
-            "\n\nADDITIONAL USER INSTRUCTIONS (follow them exactly):\n"
-            f"{custom_instruction.strip()}\n"
-            "If these instructions ask for a specific solution style (e.g. 'by "
-            "concept' or 'trick/cara cepat'), emphasize and clearly label that "
-            "style in the corresponding field."
-        )
-
-    user_prompt = (
-        f"Question:\n{json.dumps(original_q, ensure_ascii=False, indent=2)}\n\n"
-        "Generate the solution discussion (pembahasan) now."
-    )
-
-    last_error = None
-    for model in SOLUTION_MODELS:
-        try:
-            response = _completion_with_retry(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                status_callback=status_callback,
+        except RuntimeError:
+            print(f"  Page {page_index}: no questions found in text -- treating as empty.")
+            return []
+    else:
+        # Step 2: Try OCR for scanned pages
+        if is_ocr_available():
+            print(f"  Page {page_index}: no extractable text. Trying local OCR...")
+            ocr_text, ocr_conf, ocr_usable = ocr_page(
+                pdf_path, page_index, pages_dir
             )
-            raw = response.choices[0].message.content
-            result = _extract_json(raw)
-            if result and any(
-                k in result for k in ("solution_by_concept", "solution_by_trick")
-            ):
-                return result
-            print(f"  ⚠ {model} returned invalid solution structure, trying next...")
-        except Exception as e:
-            last_error = e
-            print(f"  ⚠ {model} failed: {e}, trying next...")
 
-    raise RuntimeError(f"All solution models failed. Last error: {last_error}")
+            if ocr_usable and ocr_text:
+                # Try local parse on OCR text first
+                local = parse_questions_from_text(ocr_text, page_number=page_index)
+                if local:
+                    print(f"  Page {page_index}: OCR + local parse found {len(local)} questions.")
+                    questions = local
+                else:
+                    # Use LLM to clean OCR text
+                    try:
+                        from .config import OCR_CLEANUP_MODELS, TOKEN_LIMITS, TEMPERATURES
+                        from .ai_client import build_ocr_cleanup_prompt
 
-def solve_questions(questions, custom_instruction=None, progress_callback=None,
-                    status_callback=None):
-    """Generate a solution discussion (pembahasan) for every question in place.
+                        cleanup_result = call_with_fallback(
+                            models=OCR_CLEANUP_MODELS,
+                            messages=[
+                                {"role": "system", "content": build_ocr_cleanup_prompt()},
+                                {"role": "user", "content": ocr_text},
+                            ],
+                            max_tokens=TOKEN_LIMITS.ocr_cleanup,
+                            temperature=TEMPERATURES.ocr_cleanup,
+                        )
+                        cleaned = cleanup_result.get("cleaned_text", ocr_text)
+                        questions = extract_questions_from_markdown(cleaned, page_number=page_index)
+                        if questions:
+                            for q in questions:
+                                q.extraction_method = ExtractionMethod.HYBRID
+                    except Exception:
+                        questions = []
 
-    Each question dict gains 'solution_by_concept' and 'solution_by_trick' keys
-    so the preview can show the AI explanation next to the raw question text.
+                if not questions:
+                    # Step 3: Vision model fallback for this page
+                    print(f"  Page {page_index}: OCR insufficient. Rendering and using vision model.")
+                    page_png = os.path.join(pages_dir, f"page_{page_index:02d}.png")
+                    rendered = render_page_to_image(pdf_path, page_index, page_png,
+                                                    dpi=IMAGE_CONFIG.render_dpi)
+                    if rendered:
+                        questions = extract_all_questions_from_image(
+                            page_png, custom_instruction=custom_instruction,
+                            status_callback=status_callback,
+                        )
+                    else:
+                        print(f"  Page {page_index}: could not render. Skipping.")
+                        return []
+            else:
+                # OCR not usable, fall through to vision
+                print(f"  Page {page_index}: OCR quality insufficient. Using vision model.")
+                page_png = os.path.join(pages_dir, f"page_{page_index:02d}.png")
+                rendered = render_page_to_image(pdf_path, page_index, page_png,
+                                                dpi=IMAGE_CONFIG.render_dpi)
+                if rendered:
+                    questions = extract_all_questions_from_image(
+                        page_png, custom_instruction=custom_instruction,
+                        status_callback=status_callback,
+                    )
+                else:
+                    return []
+        else:
+            # No OCR available, go straight to vision
+            print(f"  Page {page_index}: No OCR engine available. Using vision model.")
+            page_png = os.path.join(pages_dir, f"page_{page_index:02d}.png")
+            rendered = render_page_to_image(pdf_path, page_index, page_png,
+                                            dpi=IMAGE_CONFIG.render_dpi)
+            if rendered:
+                questions = extract_all_questions_from_image(
+                    page_png, custom_instruction=custom_instruction,
+                    status_callback=status_callback,
+                )
+            else:
+                return []
 
-    Args:
-        progress_callback: Optional callable(current, total, stage, message).
-            Called after every question; stage is "solve".
-        status_callback: Optional callable(message) for waiting/retry feedback.
+    # Set page numbers and metadata
+    for q in questions:
+        q.page_number = page_index
+        q.source_pdf = os.path.basename(pdf_path)
 
-    Returns the same (mutated) list of questions.
-    """
-    total = len(questions)
-    for done, q in enumerate(questions, 1):
-        solution = generate_solution(
-            q,
-            custom_instruction=custom_instruction,
-            status_callback=status_callback,
-        )
-        q["solution_by_concept"] = solution.get("solution_by_concept", "")
-        q["solution_by_trick"] = solution.get("solution_by_trick", "")
-        print(f"  ✅ Solution generated for '{q.get('id', 'Unknown ID')}'")
-        if progress_callback:
-            progress_callback(
-                done,
-                total,
-                "solve",
-                f"Membuat pembahasan soal {done} dari {total}...",
+    # Try to extract embedded images for the page
+    try:
+        images_dir = OUTPUT_CONFIG.images_dir
+        embedded = extract_embedded_images(pdf_path, page_index, images_dir)
+        for img_info in embedded:
+            img = ExtractedImage(
+                image_id=os.path.basename(img_info["path"]),
+                image_path=img_info["path"],
+                width=img_info["width"],
+                height=img_info["height"],
+                page_number=page_index,
             )
+            # Associate image with nearest question
+            if questions:
+                idx = min(img_info["index"], len(questions) - 1)
+                questions[idx].images.append(img)
+    except Exception:
+        pass  # Image extraction is best-effort
+
+    # Cache the results
+    cache_page_extraction(pdf_path, page_index, {
+        "questions": [q.to_dict() for q in questions]
+    })
+
     return questions
+
 
 def _extract_page_with_retries(extractor, page_num, questions, skipped_pages,
                                status_callback=None):
-    """Run a page's extractor function with exponential-backoff retries.
+    """Run a page's extractor with exponential-backoff retries.
 
-    `extractor` must be a zero-arg callable returning a list of question dicts.
-    Returns True when the page was extracted successfully (its questions were
-    appended to `questions`), or False when it was abandoned after
-    PAGE_MAX_RETRIES attempts.
+    Backward-compatible wrapper.
     """
     for attempt in range(1, PAGE_MAX_RETRIES + 1):
         try:
             page_questions = extractor()
             for q in page_questions:
-                q.setdefault("page", page_num)
-            print(f"  ✅ Extracted {len(page_questions)} question(s) from page {page_num}")
-            questions.extend(page_questions)
+                if not q.page_number:
+                    q.page_number = page_num
+                questions.append(q)
+            print(f"  Extracted {len(page_questions)} question(s) from page {page_num}")
             return True
         except Exception as e:
             if attempt == PAGE_MAX_RETRIES:
                 skipped_pages.append(page_num)
-                print(f"  ⚠️ Page {page_num} failed after {PAGE_MAX_RETRIES} attempts: {e}")
+                print(f"  Page {page_num} failed after {PAGE_MAX_RETRIES} attempts: {e}")
                 if status_callback:
-                    status_callback(
-                        f"⚠️ Halaman {page_num} gagal setelah {PAGE_MAX_RETRIES} percobaan."
-                    )
+                    status_callback(f"Page {page_num} failed after {PAGE_MAX_RETRIES} attempts.")
                 return False
             delay = PAGE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-            message = (
-                f"⏳ Halaman {page_num} gagal (percobaan {attempt}/{PAGE_MAX_RETRIES}); "
-                f"mencoba lagi dalam {int(delay)} detik..."
-            )
-            print(f"  {message}\n  Error: {e}")
+            msg = f"Page {page_num} failed (attempt {attempt}/{PAGE_MAX_RETRIES}); retrying in {int(delay)}s..."
+            print(f"  {msg}")
             if status_callback:
-                status_callback(message)
+                status_callback(msg)
             time.sleep(delay)
     return False
 
@@ -752,318 +458,158 @@ def _extract_page_with_retries(extractor, page_num, questions, skipped_pages,
 def extract_all_questions_from_pdf(pdf_path, custom_instruction=None,
                                    progress_callback=None, status_callback=None,
                                    max_pages=None):
-    """Extract ALL questions from every page — LOCAL-FIRST, vision as fallback.
+    """Extract ALL questions from every page. LOCAL-FIRST strategy.
 
-    Strategy (minimizes AI API usage):
-      1. The whole document is converted to clean Markdown locally with
-         pymupdf4llm — free, no AI involved, and it preserves math formulas.
-      2. Each page's Markdown is parsed offline first (zero LLM cost); if that
-         finds nothing it is sent to a cheap TEXT-ONLY model (llama-3.1-8b-
-         instant heads the chain). No image is rendered, no vision model is
-         called.
-      3. Only pages where pymupdf4llm returns empty text — i.e. scanned,
-         image-only pages with no text layer — are rendered to PNG and sent to
-         the expensive VISION model.
-
-    The page loop is "unbreakable": every page is retried (same page, same
-    input) with exponential backoff until extraction succeeds. A page is only
-    abandoned after PAGE_MAX_RETRIES attempts, and a clear warning is logged
-    (never silently skipped). RateLimitErrors are retried with their own
-    backoff inside _completion_with_retry.
-
-    Args:
-        pdf_path: Path to the input PDF exam paper.
-        custom_instruction: Optional user-provided instructions for the LLM.
-        progress_callback: Optional callable(current, total, stage, message).
-            Called after each page is extracted; stage is "extract".
-        status_callback: Optional callable(message) for waiting/retry feedback.
-        max_pages: Optional int. When set, only the first `max_pages` pages are
-            processed (useful for quick tests on a large scanned exam).
-
-    Returns (questions, skipped_pages). Each question dict carries its page number
-    under the 'page' key so batching can keep results page-aware.
+    Backward-compatible: same signature and return type as the original.
     """
-    import fitz  # PyMuPDF
+    print("  Extracting ALL questions (LOCAL-FIRST strategy)...")
 
-    print("  📄 Extracting ALL questions (LOCAL-FIRST: Markdown + cheap text "
-          "model, vision only for scanned pages)...")
-
-    pages_dir = "data/outputs/pages"
+    pages_dir = OUTPUT_CONFIG.pages_dir
     os.makedirs(pages_dir, exist_ok=True)
 
     questions = []
     skipped_pages = []
 
-    # Step 1: convert the whole document to clean Markdown locally (free, no AI).
-    # One chunk per page, in document order. Scanned/image-only pages yield "".
-    page_markdown = _extract_pdf_markdown(pdf_path)
-
-    doc = fitz.open(pdf_path)
-    page_count = doc.page_count
+    page_count = get_pdf_page_count(pdf_path)
     pages_to_process = page_count if max_pages is None else min(max_pages, page_count)
-    print(f"  📄 PDF has {page_count} page(s). Processing {pages_to_process}.")
+    print(f"  PDF has {page_count} page(s). Processing {pages_to_process}.")
 
     for i in range(pages_to_process):
-        text = page_markdown.get(i, "")
-        usable, has_markers = _assess_page_text(text)
+        page_num = i + 1
 
-        if usable:
-            print(f"  Page {i + 1}: Extracted {len(text)} markdown chars. "
-                  f"Contains question markers: {has_markers}. Using cheap TEXT model.")
-            extracted = _extract_page_with_retries(
-                lambda: extract_all_questions_from_page_text(
-                    text,
-                    custom_instruction=custom_instruction,
-                    status_callback=status_callback,
-                ),
-                page_num=i + 1,
-                questions=questions,
-                skipped_pages=skipped_pages,
+        extracted = _extract_page_with_retries(
+            lambda p=page_num: extract_page_questions(
+                pdf_path, p,
+                custom_instruction=custom_instruction,
                 status_callback=status_callback,
-            )
-        else:
-            # pymupdf4llm returned no usable text — this is a scanned
-            # (image-only) page that genuinely needs the vision model.
-            page_label = f"page_{i + 1:02d}"
-            try:
-                pix = doc[i].get_pixmap(dpi=200)
-                page_png = os.path.join(pages_dir, f"{page_label}.png")
-                pix.save(page_png)
-                print(f"  ✅ Rendered page {i + 1} to {page_png}")
-            except Exception as e:
-                skipped_pages.append(i + 1)
-                print(f"  ⚠️ Page {i + 1} could not be rendered: {e}")
-                continue
-
-            print(f"  Page {i + 1}: no extractable text (scanned image page). "
-                  f"Rendering page and using VISION model.")
-            extracted = _extract_page_with_retries(
-                lambda: extract_all_questions_from_image(
-                    page_png,
-                    custom_instruction=custom_instruction,
-                    status_callback=status_callback,
-                ),
-                page_num=i + 1,
-                questions=questions,
-                skipped_pages=skipped_pages,
-                status_callback=status_callback,
-            )
+            ),
+            page_num=i + 1,
+            questions=questions,
+            skipped_pages=skipped_pages,
+            status_callback=status_callback,
+        )
 
         if not extracted:
             continue
 
         if progress_callback:
             progress_callback(
-                i + 1,
-                pages_to_process,
-                "extract",
-                f"Sedang mengekstrak soal dari halaman {i + 1} dari {pages_to_process}...",
+                i + 1, pages_to_process, "extract",
+                f"Extracting page {i + 1} of {pages_to_process}...",
             )
 
-        # Throttle between pages to avoid hitting the Groq free-tier
-        # 8000 TPM rate limit when processing many pages.
+        # Throttle between pages
         if i + 1 < pages_to_process:
-            throttle_message = (
-                f"⏳ Menunggu {int(EXTRACTION_DELAY_SECONDS)} detik untuk menghormati "
-                f"batas rate limit..."
-            )
-            print(f"  {throttle_message}")
+            throttle_msg = f"Waiting {int(EXTRACTION_DELAY_SECONDS)}s for rate limit..."
+            print(f"  {throttle_msg}")
             if status_callback:
-                status_callback(throttle_message)
+                status_callback(throttle_msg)
             time.sleep(EXTRACTION_DELAY_SECONDS)
-    doc.close()
+
+    # Validate all extracted questions
+    valid, warned, invalid = validate_batch(questions)
+    print(f"  Validation: {valid} valid, {warned} warnings, {invalid} invalid")
 
     return questions, skipped_pages
 
 
-def get_pdf_page_count(pdf_path):
-    """Return the number of pages in a PDF (local, no AI involved)."""
-    import fitz  # PyMuPDF
+# ---------------------------------------------------------------------------
+# Variation generation (backward-compatible)
+# ---------------------------------------------------------------------------
 
-    with fitz.open(pdf_path) as doc:
-        return doc.page_count
-
-
-def extract_page_questions(pdf_path, page_index, custom_instruction=None,
-                           status_callback=None):
-    """Extract ALL complete questions from ONE page (1-based page_index).
-
-    The on-demand primitive behind the step-by-step app workflow: only this
-    single page is converted and sent to the models, so one click extracts
-    exactly one page — local parse first, cheap TEXT model next, vision only
-    when the page is scanned (no extractable text). No other page is touched,
-    and no rate-limit sleep is inserted (the user drives the pacing).
-
-    Returns a list of question dicts, each carrying a 'page' key set to
-    page_index. Returns an empty list when the page has no questions.
-    """
-    import fitz  # PyMuPDF
-
-    pages_dir = "data/outputs/pages"
-    os.makedirs(pages_dir, exist_ok=True)
-
-    markdown = _extract_pdf_markdown(pdf_path, pages=[page_index - 1])
-    text = markdown.get(page_index - 1, "")
-    usable, has_markers = _assess_page_text(text)
-
-    if usable:
-        print(f"  Page {page_index}: Extracted {len(text)} markdown chars. "
-              f"Contains question markers: {has_markers}. Using cheap TEXT model.")
-        try:
-            questions = extract_all_questions_from_page_text(
-                text,
-                custom_instruction=custom_instruction,
-                status_callback=status_callback,
-            )
-        except RuntimeError:
-            # The text exists but no complete questions could be found on this
-            # page (e.g. a cover/header page). Treat it as empty so the caller
-            # advances to the next page instead of crashing.
-            print(f"  Page {page_index}: no questions found in the text — "
-                  "treating the page as empty.")
-            return []
-    else:
-        page_label = f"page_{page_index:02d}"
-        with fitz.open(pdf_path) as doc:
-            pix = doc[page_index - 1].get_pixmap(dpi=200)
-            page_png = os.path.join(pages_dir, f"{page_label}.png")
-            pix.save(page_png)
-        print(f"  Page {page_index}: no extractable text (scanned image page). "
-              f"Rendering page and using VISION model.")
-        questions = extract_all_questions_from_image(
-            page_png,
-            custom_instruction=custom_instruction,
-            status_callback=status_callback,
-        )
-
-    for q in questions:
-        q["page"] = page_index
-    return questions
+def generate_variations(original_q, custom_instruction=None, status_callback=None):
+    """Generate easy/medium/hard variations. Backward-compatible."""
+    from .variation_generator import generate_variations as _gen
+    return _gen(original_q, custom_instruction=custom_instruction,
+                status_callback=status_callback)
 
 
-def _generate_variation_results(questions, start=0, batch_size=None,
-                                custom_instruction=None, progress_callback=None,
-                                status_callback=None):
-    """Shared engine that generates easy/medium/hard variations for a question slice.
+def generate_solution(original_q, custom_instruction=None, status_callback=None):
+    """Generate solution. Backward-compatible."""
+    from .solution_generator import generate_solution as _gen
+    return _gen(original_q, custom_instruction=custom_instruction,
+                status_callback=status_callback)
 
-    This is the single implementation behind generate_variation_batch and
-    generate_variation_results. When batch_size is None, every question from
-    `start` to the end of the list is processed.
 
-    Args:
-        questions: The full list of questions to process.
-        start: Index of the first question in this slice.
-        batch_size: How many questions to process; None means "the rest".
-        custom_instruction: Optional user-provided instructions for the LLM.
-        progress_callback: Optional callable(current, total, stage, message).
-            Called after every question; stage is "vary" and current is the
-            global question index across the whole exam.
-        status_callback: Optional callable(message) for waiting/retry feedback.
-
-    Returns a list of result items with the same shape the DOCX exporter expects:
-    {"page": ..., "original": ..., "variations": ...}.
-    """
-    if batch_size is None:
-        batch_size = len(questions) - start
-
-    results = []
-    total = len(questions)
-    for offset, original_q in enumerate(questions[start:start + batch_size]):
-        variations = generate_variations(
-            original_q,
-            custom_instruction=custom_instruction,
-            status_callback=status_callback,
-        )
-        results.append({
-            "page": original_q.get("page"),
-            "original": original_q,
-            "variations": variations,
-        })
-        print(f"  ✅ Variations generated for '{original_q.get('id', 'Unknown ID')}'")
-        if progress_callback:
-            done = start + offset + 1
-            progress_callback(
-                done,
-                total,
-                "vary",
-                f"Membuat variasi soal {done} dari {total}...",
-            )
-    return results
+def solve_questions(questions, custom_instruction=None, progress_callback=None,
+                    status_callback=None):
+    """Solve questions. Backward-compatible."""
+    return _solve_questions(questions, custom_instruction=custom_instruction,
+                           progress_callback=progress_callback,
+                           status_callback=status_callback)
 
 
 def generate_variation_batch(questions, start, batch_size, custom_instruction=None,
                              progress_callback=None, status_callback=None):
-    """Generate easy/medium/hard variations for questions[start:start + batch_size].
+    """Generate variation batch. Backward-compatible.
 
-    Progress uses the global question index (start + offset + 1) so batching
-    over the whole exam keeps the count continuous across batches.
+    Returns list of VariationResult dicts (for backward compat with old format).
     """
-    return _generate_variation_results(
-        questions,
-        start=start,
-        batch_size=batch_size,
+    results = _generate_variation_batch(
+        questions, start=start, batch_size=batch_size,
         custom_instruction=custom_instruction,
         progress_callback=progress_callback,
         status_callback=status_callback,
     )
+    # Convert to old dict format for backward compatibility
+    return [r.to_dict() for r in results]
 
 
-def generate_variation_results(questions, custom_instruction=None, progress_callback=None,
-                               status_callback=None):
-    """Generate easy/medium/hard variations for an already-selected list of questions.
-
-    Thin wrapper around _generate_variation_results that processes the whole
-    list in one pass.
-    """
-    return _generate_variation_results(
-        questions,
-        start=0,
-        batch_size=None,
-        custom_instruction=custom_instruction,
+def generate_variation_results(questions, custom_instruction=None,
+                               progress_callback=None, status_callback=None):
+    """Generate variations for all questions. Backward-compatible."""
+    results = generate_all_variations(
+        questions, custom_instruction=custom_instruction,
         progress_callback=progress_callback,
         status_callback=status_callback,
     )
+    return [r.to_dict() for r in results]
 
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
 
 def export_results(results, output_docx):
-    """Export collected results to DOCX and write the JSON preview sidecar."""
-    export_docx(results, output_docx)
+    """Export results to DOCX and JSON sidecar. Backward-compatible."""
+    # Build the questions list in the format docx_exporter expects
+    questions_for_export = []
+    for item in results:
+        if isinstance(item, dict):
+            # Already in dict format (from variation results)
+            questions_for_export.append(item)
+        elif isinstance(item, VariationResult):
+            questions_for_export.append(item.to_dict())
+        elif isinstance(item, Question):
+            # Single question without variations
+            questions_for_export.append({
+                "page": item.page_number,
+                "original": item.to_dict(),
+                "variations": {},
+            })
+
+    export_docx(questions_for_export, output_docx)
 
     results_path = output_docx.rsplit(".", 1)[0] + ".json"
     with open(results_path, "w", encoding="utf-8") as f:
-        json.dump({"questions": results}, f, ensure_ascii=False, indent=2)
+        json.dump({"questions": questions_for_export}, f, ensure_ascii=False, indent=2)
 
-    print(f"  [4/4] DOCX saved to: {output_docx}")
+    print(f"  DOCX saved to: {output_docx}")
     return output_docx
 
+
+# ---------------------------------------------------------------------------
+# Full pipeline
+# ---------------------------------------------------------------------------
 
 def run_pipeline(pdf_path, output_docx, custom_instruction=None,
                  batch_size=5, continue_callback=None, progress_callback=None,
                  status_callback=None, max_pages=None):
-    """Run the full pipeline: PDF -> Markdown -> Extract (all questions) -> Vary -> DOCX.
+    """Run the full pipeline: PDF -> Extract -> Vary -> DOCX.
 
-    Args:
-        pdf_path: Path to the input PDF exam paper.
-        output_docx: Where to save the generated Word document.
-        custom_instruction: Optional user-provided instructions for the LLM
-            (e.g. "Buat penyelesaian dengan konsep dasar dan cara cepat").
-        batch_size: How many questions are varied per batch.
-        continue_callback: Optional callable(processed_count, total_count) -> bool.
-            Called after every batch once at least one batch has completed; return
-            False to stop early and export only the questions processed so far.
-            When None (e.g. CLI), the whole exam is processed without pausing.
-        progress_callback: Optional callable(current, total, stage, message) where
-            stage is "extract" (current/total = page X of N) or "vary"
-            (current/total = question X of N). Used by the UI to drive a live
-            progress bar.
-        status_callback: Optional callable(message) for waiting/retry feedback.
-        max_pages: Optional int. When set, only the first `max_pages` pages are
-            extracted (useful for quick tests on a large scanned exam).
-
-    Every page is retried with exponential backoff until it succeeds, or until
-    a hard maximum of retries is hit — in which case a clear warning is logged.
+    Backward-compatible: same signature as the original.
     """
-    print("🚀 Starting End-to-End Exam Generator Pipeline...\n")
+    print("Starting End-to-End Exam Generator Pipeline...\n")
 
     all_questions, skipped_pages = extract_all_questions_from_pdf(
         pdf_path,
@@ -1076,37 +622,44 @@ def run_pipeline(pdf_path, output_docx, custom_instruction=None,
     if not all_questions:
         last = f" Last error was on page {skipped_pages[-1]}." if skipped_pages else ""
         raise RuntimeError(
-            f"Pipeline produced no questions — every page failed.{last} "
+            f"Pipeline produced no questions -- every page failed.{last} "
             "Check the logs above."
         )
 
     total = len(all_questions)
-    print(f"\n  ✅ Extracted {total} question(s). "
+    print(f"\n  Extracted {total} question(s). "
           f"Generating variations in batches of {batch_size}...")
     if skipped_pages:
-        print(f"  ⚠ Skipped page(s): {skipped_pages}")
+        print(f"  Skipped page(s): {skipped_pages}")
 
-    questions = []
+    # Convert Questions to dicts for variation generation
+    questions_as_dicts = [q.to_dict() for q in all_questions]
+
+    results = []
     for start in range(0, total, batch_size):
-        questions.extend(generate_variation_batch(
-            all_questions, start, batch_size,
+        batch_results = generate_variation_batch(
+            questions_as_dicts, start, batch_size,
             custom_instruction=custom_instruction,
             progress_callback=progress_callback,
             status_callback=status_callback,
-        ))
-        processed = len(questions)
-        print(f"  ✅ Variations generated for {processed}/{total} question(s).")
+        )
+        results.extend(batch_results)
+        processed = len(results)
+        print(f"  Variations generated for {processed}/{total} question(s).")
         if continue_callback and processed < total:
             if not continue_callback(processed, total):
-                print("  ⏹ Processing stopped by user callback — exporting partial results.")
+                print("  Processing stopped by user -- exporting partial results.")
                 break
 
-    # 4. Export every collected question to a single Word document
-    export_results(questions, output_docx)
-    print(f"✅ Success! {len(questions)}/{total} question(s) exported to: {output_docx}")
+    export_results(results, output_docx)
+    print(f"Success! {len(results)}/{total} question(s) exported to: {output_docx}")
 
     return output_docx
 
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1117,7 +670,7 @@ def main():
     parser.add_argument("--output", default="data/outputs/final_pipeline_test.docx",
                         help="Where to save the generated DOCX.")
     parser.add_argument("--max-pages", type=int, default=None,
-                        help="Only process the first N pages (e.g. 3 for a quick test).")
+                        help="Only process the first N pages.")
     args = parser.parse_args()
 
     run_pipeline(
@@ -1125,6 +678,7 @@ def main():
         output_docx=args.output,
         max_pages=args.max_pages,
     )
+
 
 if __name__ == "__main__":
     main()

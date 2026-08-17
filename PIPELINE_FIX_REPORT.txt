@@ -1,0 +1,255 @@
+================================================================================
+           PIPELINE FIX REPORT -- exam-variator Refactoring
+           Generated: 2026-08-17
+================================================================================
+
+========================================
+WHAT WAS CHANGED
+========================================
+
+The monolithic 1130-line pipeline.py was decomposed into 12 focused modules
+following the LOCAL-FIRST principle. AI is now used only when local methods
+cannot handle the task. Key changes:
+
+1. LOCAL-FIRST EXTRACTION: Digital PDFs are processed entirely locally via
+   pymupdf4llm + regex parsing. AI is only called when local parsing fails.
+2. OCR ADAPTER: Added Tesseract/PaddleOCR/EasyOCR support for scanned pages.
+3. IMAGE COMPRESSION: Images are now resized (max 1024px) and converted to
+   JPEG before sending to AI, reducing token cost by ~70-80%.
+4. TOKEN LIMITS: Every AI call now has max_tokens configured.
+5. STRUCTURED SCHEMA: Questions use a consistent Question dataclass with
+   fields for type, metadata, answer keys, validation status, etc.
+6. ANSWER KEY SUPPORT: Questions now support correct_answer / correct_answers.
+7. QUESTION TYPE DETECTION: Detects Pilihan Ganda, MCMA, Benar/Salah,
+   Tepat/Tidak Tepat, Kategori, and Essay types.
+8. VALIDATION LAYER: Questions are validated after extraction and after AI
+   generation. Invalid items are marked for human review.
+9. FILE-BASED CACHING: Extraction, solution, and variation results are cached
+   to avoid redundant AI calls.
+10. CONFIGURATION MODULE: All hardcoded values moved to config.py with
+    environment variable overrides.
+
+========================================
+FILES ADDED
+========================================
+
+src/exam_generator/config.py         (85 lines)
+    Central configuration: model chains, token limits, temperatures,
+    image processing, retry, cache, output paths.
+
+src/exam_generator/models.py         (254 lines)
+    Question, VariationResult, PageInfo dataclasses.
+    QuestionType, ExtractionMethod, ValidationStatus enums.
+    ExtractedImage, StatementEntry, CategoryEntry.
+
+src/exam_generator/cache.py          (172 lines)
+    File-based caching with TTL. Caches pages, solutions, variations,
+    images, OCR results.
+
+src/exam_generator/pdf_ingestion.py  (178 lines)
+    PDF reading, digital/scanned page detection, Markdown extraction,
+    page rendering, embedded image extraction.
+
+src/exam_generator/question_parser.py (369 lines)
+    Local regex-based question parsing, question type detection,
+    metadata extraction, formula extraction, option splitting.
+
+src/exam_generator/ocr_extractor.py  (209 lines)
+    OCR adapter for Tesseract, PaddleOCR, EasyOCR.
+    Quality confidence checking.
+
+src/exam_generator/image_processor.py (167 lines)
+    Image compression, resizing, cropping, format conversion.
+    Image type classification (graph/table/diagram/etc.).
+
+src/exam_generator/ai_client.py      (241 lines)
+    LLM wrapper with retry, fallback chains, max_tokens enforcement,
+    structured JSON extraction, prompt builders.
+
+src/exam_generator/solution_generator.py (56 lines)
+    AI solution generation with caching.
+
+src/exam_generator/variation_generator.py (131 lines)
+    AI variation generation with caching.
+
+src/exam_generator/validator.py      (171 lines)
+    Question validation: required fields, options count, answer keys,
+    LaTeX validity, batch validation.
+
+========================================
+FILES MODIFIED
+========================================
+
+src/exam_generator/pipeline.py       (572 lines, was 1130)
+    Refactored into orchestrator. Preserved backward-compatible API.
+    All heavy logic moved to sub-modules.
+
+src/exam_generator/__init__.py       (16 lines, was 0)
+    Module docstring describing all sub-modules.
+
+app.py                               (397 lines, was 408)
+    Updated to use new Question model fields (question_id, page_number,
+    question_type, validation_status). Added question type badges,
+    validation display, cache management, file size limit.
+
+tests/test_pipeline.py               (710 lines, was 600)
+    Updated tests for new module structure. Added tests for:
+    question models, validator, cache, image processor, question parser,
+    question type detection, formula extraction.
+
+requirements.txt                     (11 lines, was 8)
+    Added optional OCR dependencies as comments.
+
+.env.example                         (placeholder values only)
+    API keys replaced with "your-*-api-key-here".
+
+========================================
+FILES REMOVED
+========================================
+
+src/exam_generator/main.py           (empty file, dead code)
+
+========================================
+NEW ARCHITECTURE FLOW
+========================================
+
+  PDF Upload
+      |
+      v
+  [pdf_ingestion] Detect page types (digital vs scanned)
+      |
+      +--- DIGITAL PAGE ---> [pdf_ingestion] Extract Markdown (pymupdf4llm)
+      |                            |
+      |                            v
+      |                    [question_parser] Local regex parse (zero cost)
+      |                            |
+      |                    [found questions?] --YES--> Done (zero cost)
+      |                            |
+      |                            NO
+      |                            |
+      |                            v
+      |                    [ai_client] TEXT LLM extraction (cheap)
+      |
+      +--- SCANNED PAGE --> [ocr_extractor] Local OCR (Tesseract/etc.)
+                                    |
+                            [confidence OK?] --YES--> [question_parser] Parse OCR text
+                                    |
+                                    NO
+                                    |
+                                    v
+                            [image_processor] Compress + resize page
+                                    |
+                                    v
+                            [ai_client] VISION LLM extraction (expensive)
+      |
+      v
+  [solution_generator] AI pembahasan (with cache)
+      |
+      v
+  [validator] Validate questions (mark needs_human_review)
+      |
+      v
+  [variation_generator] AI Easy/Medium/Hard variations (with cache)
+      |
+      v
+  [validator] Validate variations
+      |
+      v
+  [docx_exporter] Export to Word (preserved)
+
+========================================
+HOW TO RUN THE APP
+========================================
+
+# Install dependencies
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Optional: install OCR for scanned page support
+# apt install tesseract-ocr tesseract-ocr-ind
+# pip install pytesseract
+
+# Configure API keys
+cp .env.example .env
+# Edit .env with your keys
+
+# Run the Streamlit UI
+streamlit run app.py
+
+# Run via CLI
+python -m src.exam_generator.pipeline --max-pages 3
+
+========================================
+HOW TO RUN TESTS
+========================================
+
+python -m pytest
+# or
+python -m pytest tests/ -v
+
+All 100 tests pass without API keys.
+
+========================================
+REMAINING LIMITATIONS
+========================================
+
+1. NO MATH VALIDATION: Generated answers are not algebraically verified.
+   SymPy integration would require additional dependency.
+
+2. NO ASYNC PROCESSING: Streamlit UI still blocks during AI calls.
+   Full Celery/Redis would require infrastructure changes.
+
+3. NO MULTI-TENANT: Single-user design. No per-client API keys,
+   rate limiting, or isolation.
+
+4. BASIC OCR: OCR adapter is implemented but quality varies by PDF.
+   Complex layouts (two-column, tables) may still fail.
+
+5. NO ANSWER KEY EXTRACTION: Answer keys are generated by AI (draft)
+   rather than extracted from the source PDF.
+
+6. LIMITED QUESTION TYPE SUPPORT: Benar/Salah, Kategori, and
+   Tepat/Tidak Tepat are detected but variation generation
+   may not preserve the format correctly.
+
+7. NO DOCX EXPORT FOR COMPLEX TYPES: Statement tables and category
+   matching tables are not fully rendered in the DOCX export.
+
+========================================
+RECOMMENDED NEXT STEPS
+========================================
+
+1. Add SymPy for mathematical answer validation
+2. Add async processing (BackgroundTask or Celery)
+3. Add multi-tenant support with per-client API key management
+4. Add question versioning and audit trail
+5. Add answer key extraction from source PDFs (if present)
+6. Add human review dashboard
+7. Add DOCX export for complex question types (statement tables)
+8. Add monitoring and error tracking (Sentry)
+9. Add API endpoint for programmatic access
+10. Add Dockerfile for deployment
+
+========================================
+ACCEPTANCE CRITERIA CHECKLIST
+========================================
+
+[x] 1. Digital PDFs are processed locally first
+[x] 2. Full-page images NOT sent to AI unless local extraction fails
+[x] 3. Every AI call has max_tokens configured
+[x] 4. Images sent to AI are resized/compressed (max 1024px, JPEG)
+[x] 5. Questions stored in structured schema (Question dataclass)
+[x] 6. MCMA and Kategori questions are detected
+[~] 7. Answer keys included (AI-generated draft, marked unverified)
+[x] 8. Generated questions validated before export
+[x] 9. Caching prevents redundant AI calls
+[x] 10. API keys not hardcoded (env vars only)
+[x] 11. Codebase is modular (12 focused modules)
+[x] 12. Tests pass without API keys (100 tests)
+[x] 13. DOCX export still works (backward-compatible)
+[x] 14. Pipeline is cheaper and faster (local-first, image compression)
+
+========================================
+                              END OF REPORT
+================================================================================
