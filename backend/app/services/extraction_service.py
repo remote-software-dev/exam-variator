@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-ENGINE_DIR = Path(__file__).resolve().parent.parent.parent / "src"
+ENGINE_DIR = Path(__file__).resolve().parent.parent.parent
 if str(ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(ENGINE_DIR))
 
@@ -21,7 +21,7 @@ def run_extraction(job_id: str):
 
         job_service.set_job_phase(db, job, JobPhase.EXTRACTING)
 
-        from exam_generator.pipeline import (
+        from engine.pipeline import (
             extract_all_questions_from_pdf, get_pdf_page_count, solve_questions
         )
 
@@ -95,7 +95,7 @@ def run_variations(job_id: str):
 
         job_service.set_job_phase(db, job, JobPhase.VARYING)
 
-        from exam_generator.pipeline import generate_variation_results
+        from engine.pipeline import generate_variation_results
 
         questions = job.questions_json or []
         selected = job.selected_indices or []
@@ -139,7 +139,7 @@ def run_export(job_id: str):
         if not job:
             return
 
-        from exam_generator.pipeline import export_results
+        from engine.pipeline import export_results
 
         variations = job.variations_json or []
         output_path = str(Path(job.pdf_path).parent / "result.docx")

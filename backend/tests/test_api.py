@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 # Ensure engine is importable
-ENGINE_DIR = Path(__file__).resolve().parent.parent.parent / "src"
+ENGINE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ENGINE_DIR))
 
 # Configure in-memory SQLite before importing app modules
