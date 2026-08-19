@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { useParams } from "next/navigation";
 import { getJob, getVariations } from "@/lib/api";
+import { cleanAiText } from "@/lib/format";
 import type { JobDetail, VariationResult } from "@/lib/types";
 
 const DIFFICULTY_LABELS: Record<string, { label: string; color: string }> = {
@@ -113,13 +114,13 @@ export default function VariationsPage() {
                         {q.solution_by_concept && (
                           <details className="mt-2">
                             <summary className="text-xs text-blue-600 cursor-pointer">Pembahasan Konsep</summary>
-                            <p className="text-xs text-gray-600 mt-1">{q.solution_by_concept}</p>
+                            <p className="text-xs text-gray-600 mt-1 whitespace-pre-line">{cleanAiText(q.solution_by_concept)}</p>
                           </details>
                         )}
                         {q.solution_by_trick && (
                           <details className="mt-1">
                             <summary className="text-xs text-blue-600 cursor-pointer">Cara Cepat</summary>
-                            <p className="text-xs text-gray-600 mt-1">{q.solution_by_trick}</p>
+                            <p className="text-xs text-gray-600 mt-1 whitespace-pre-line">{cleanAiText(q.solution_by_trick)}</p>
                           </details>
                         )}
                       </div>

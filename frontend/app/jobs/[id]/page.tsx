@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { getJob, getQuestions, updateQuestion, bulkSelectQuestions, triggerVariations } from "@/lib/api";
+import { cleanAiText } from "@/lib/format";
 import type { JobDetail, Question } from "@/lib/types";
 
 const TYPE_BADGES: Record<string, { label: string; color: string }> = {
@@ -213,12 +214,12 @@ export default function JobDetailPage() {
                   {(q.solution_by_concept || q.solution_by_trick) && (
                     <details className="mt-3">
                       <summary className="text-sm text-blue-600 cursor-pointer">Pembahasan AI</summary>
-                      <div className="mt-2 space-y-2 text-sm text-gray-600">
+                      <div className="mt-2 space-y-2 text-sm text-gray-600 whitespace-pre-line">
                         {q.solution_by_concept && (
-                          <div><strong>Konsep Dasar:</strong> {q.solution_by_concept}</div>
+                          <div><strong>Konsep Dasar:</strong> {cleanAiText(q.solution_by_concept)}</div>
                         )}
                         {q.solution_by_trick && (
-                          <div><strong>Cara Cepat:</strong> {q.solution_by_trick}</div>
+                          <div><strong>Cara Cepat:</strong> {cleanAiText(q.solution_by_trick)}</div>
                         )}
                       </div>
                     </details>

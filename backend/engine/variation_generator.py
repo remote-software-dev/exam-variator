@@ -52,17 +52,24 @@ def generate_variations(question: Question, custom_instruction: str = None,
     return result
 
 
-def _variation_dict_to_question(var_data: dict, difficulty: str) -> Question:
+def _variation_dict_to_question(var_data: dict, difficulty: str,
+                                 parent_id: str = "", page_num: int = 0) -> Question:
     """Convert a variation dict from AI output to a Question object."""
     if not var_data:
         return None
 
+    question_id = var_data.get("question_id", "")
+    if not question_id:
+        question_id = f"{parent_id}_{difficulty}" if parent_id else f"var_{difficulty}"
+
     q = Question(
+        question_id=question_id,
         question_text=var_data.get("question_text", ""),
         options=var_data.get("options", []),
         option_labels=[chr(65 + i) for i in range(len(var_data.get("options", [])))],
         solution_by_concept=var_data.get("solution_by_concept", ""),
         solution_by_trick=var_data.get("solution_by_trick", ""),
+        page_number=page_num,
     )
     return q
 
@@ -75,9 +82,15 @@ def generate_variation_for_question(question: Question, custom_instruction: str 
 
     result = VariationResult(
         original=question,
-        easy=_variation_dict_to_question(raw.get("easy"), "easy"),
-        medium=_variation_dict_to_question(raw.get("medium"), "medium"),
-        hard=_variation_dict_to_question(raw.get("hard"), "hard"),
+        easy=_variation_dict_to_question(raw.get("easy"), "easy",
+                                         parent_id=question.question_id,
+                                         page_num=question.page_number),
+        medium=_variation_dict_to_question(raw.get("medium"), "medium",
+                                           parent_id=question.question_id,
+                                           page_num=question.page_number),
+        hard=_variation_dict_to_question(raw.get("hard"), "hard",
+                                         parent_id=question.question_id,
+                                         page_num=question.page_number),
         page=question.page_number,
     )
 
