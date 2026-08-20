@@ -1,0 +1,39 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Environment Variables (NEVER commit your API keys!)
+.env
+.env.local
+.env.production
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE folders
+.vscode/
+.idea/
+
+# Runtime data
+data/
+
+# Backend
+backend_exam_variator/.venv/
+backend_exam_variator/data/
+backend_exam_variator/__pycache__/
+backend_exam_variator/app/__pycache__/
+backend_exam_variator/app/routers/__pycache__/
+backend_exam_variator/app/services/__pycache__/
+backend_exam_variator/tests/__pycache__/
+backend_exam_variator/.pytest_cache/
+
+# Frontend
+frontend_exam_variator/.next/
+frontend_exam_variator/node_modules/
+frontend_exam_variator/out/
+
+# Test cache
+.pytest_cache/
