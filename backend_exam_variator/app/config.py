@@ -1,5 +1,7 @@
 """Backend configuration."""
 
+import os
+
 from pathlib import Path
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
@@ -7,7 +9,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR.parent / "data"
+DATA_DIR = Path(os.environ.get("EXAM_DATA_DIR") or BASE_DIR.parent / "data")
+FRONTEND_DIR = Path(
+    os.environ.get("EXAM_FRONTEND_DIR") or BASE_DIR.parent / "frontend_exam_variator" / "out"
+)
 JOBS_DIR = DATA_DIR / "jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
