@@ -37,6 +37,3 @@ frontend_exam_variator/out/
 
 # Test cache
 .pytest_cache/
-
-# CI handled via web UI until PAT gains workflow scope
-.github/
